@@ -7,6 +7,13 @@ reloadable = true
 # filenames (libggml.so, ...) that would collide between same-OS architectures
 # (linux x86_64 vs arm64) in a flat dir. The binding's $ORIGIN/@loader_path rpath
 # finds its siblings in the same dir.
+#
+# macOS is the exception: both arches share one apple-darwin/ dir holding universal
+# (lipo'd) ggml/llama dylibs. Godot resolves [libraries] by most-specific tag match
+# but [dependencies] by *first* match (find_extension_dependencies breaks on the
+# first matching tag set), and the macos.debug/macos.release keys carry no arch tag,
+# so they always win over macos.*.arm64. An arch-split macOS dylib set is therefore
+# unexpressible: the arm64 binding would always be paired with x86_64 dylibs.
 [libraries]
 linux.debug.x86_64 =     "res://addons/nobodywho/x86_64-unknown-linux-gnu/libnobodywho-godot-x86_64-unknown-linux-gnu-release.so"
 linux.release.x86_64 =   "res://addons/nobodywho/x86_64-unknown-linux-gnu/libnobodywho-godot-x86_64-unknown-linux-gnu-release.so"
@@ -21,10 +28,14 @@ macos.release.arm64 =    "res://addons/nobodywho/aarch64-apple-darwin/libnobodyw
 android.debug.arm64 =      "res://addons/nobodywho/aarch64-linux-android/libnobodywho-godot-aarch64-linux-android-release.so"
 android.release.arm64 =    "res://addons/nobodywho/aarch64-linux-android/libnobodywho-godot-aarch64-linux-android-release.so"
 
-# Dependencies Godot ships next to the binding on export; the empty destination
-# string keeps each in the binding's directory (where its rpath expects it). The
-# per-platform ggml set differs: macOS libggml-metal, Linux libggml-vulkan,
-# Android CPU only (no Vulkan/Metal).
+# Dependencies Godot ships next to the binding on export. Godot adds the binding
+# itself with an empty destination too, so an empty destination here lands both in
+# the same directory — next to the game executable, or Contents/Frameworks in a
+# macOS .app — which is what the binding's rpath expects.
+#
+# The per-platform ggml set differs: macOS libggml-metal, Linux libggml-vulkan,
+# Android CPU only (no Vulkan/Metal). macOS has one arch-neutral entry per profile,
+# see the [libraries] note above.
 [dependencies]
 linux.debug.x86_64 = { "res://addons/nobodywho/x86_64-unknown-linux-gnu/libggml.so": "", "res://addons/nobodywho/x86_64-unknown-linux-gnu/libggml-base.so": "", "res://addons/nobodywho/x86_64-unknown-linux-gnu/libggml-cpu.so": "", "res://addons/nobodywho/x86_64-unknown-linux-gnu/libggml-vulkan.so": "", "res://addons/nobodywho/x86_64-unknown-linux-gnu/libllama.so": "", "res://addons/nobodywho/x86_64-unknown-linux-gnu/libllama-common.so": "" }
 linux.release.x86_64 = { "res://addons/nobodywho/x86_64-unknown-linux-gnu/libggml.so": "", "res://addons/nobodywho/x86_64-unknown-linux-gnu/libggml-base.so": "", "res://addons/nobodywho/x86_64-unknown-linux-gnu/libggml-cpu.so": "", "res://addons/nobodywho/x86_64-unknown-linux-gnu/libggml-vulkan.so": "", "res://addons/nobodywho/x86_64-unknown-linux-gnu/libllama.so": "", "res://addons/nobodywho/x86_64-unknown-linux-gnu/libllama-common.so": "" }
@@ -32,10 +43,8 @@ linux.debug.arm64 = { "res://addons/nobodywho/aarch64-unknown-linux-gnu/libggml.
 linux.release.arm64 = { "res://addons/nobodywho/aarch64-unknown-linux-gnu/libggml.so": "", "res://addons/nobodywho/aarch64-unknown-linux-gnu/libggml-base.so": "", "res://addons/nobodywho/aarch64-unknown-linux-gnu/libggml-cpu.so": "", "res://addons/nobodywho/aarch64-unknown-linux-gnu/libggml-vulkan.so": "", "res://addons/nobodywho/aarch64-unknown-linux-gnu/libllama.so": "", "res://addons/nobodywho/aarch64-unknown-linux-gnu/libllama-common.so": "" }
 windows.debug.x86_64 = { "res://addons/nobodywho/x86_64-pc-windows-msvc/ggml.dll": "", "res://addons/nobodywho/x86_64-pc-windows-msvc/ggml-base.dll": "", "res://addons/nobodywho/x86_64-pc-windows-msvc/ggml-cpu.dll": "", "res://addons/nobodywho/x86_64-pc-windows-msvc/ggml-vulkan.dll": "", "res://addons/nobodywho/x86_64-pc-windows-msvc/llama.dll": "", "res://addons/nobodywho/x86_64-pc-windows-msvc/llama-common.dll": "" }
 windows.release.x86_64 = { "res://addons/nobodywho/x86_64-pc-windows-msvc/ggml.dll": "", "res://addons/nobodywho/x86_64-pc-windows-msvc/ggml-base.dll": "", "res://addons/nobodywho/x86_64-pc-windows-msvc/ggml-cpu.dll": "", "res://addons/nobodywho/x86_64-pc-windows-msvc/ggml-vulkan.dll": "", "res://addons/nobodywho/x86_64-pc-windows-msvc/llama.dll": "", "res://addons/nobodywho/x86_64-pc-windows-msvc/llama-common.dll": "" }
-macos.debug = { "res://addons/nobodywho/x86_64-apple-darwin/libggml.dylib": "", "res://addons/nobodywho/x86_64-apple-darwin/libggml-base.dylib": "", "res://addons/nobodywho/x86_64-apple-darwin/libggml-cpu.dylib": "", "res://addons/nobodywho/x86_64-apple-darwin/libggml-metal.dylib": "", "res://addons/nobodywho/x86_64-apple-darwin/libllama.dylib": "", "res://addons/nobodywho/x86_64-apple-darwin/libllama-common.dylib": "" }
-macos.release = { "res://addons/nobodywho/x86_64-apple-darwin/libggml.dylib": "", "res://addons/nobodywho/x86_64-apple-darwin/libggml-base.dylib": "", "res://addons/nobodywho/x86_64-apple-darwin/libggml-cpu.dylib": "", "res://addons/nobodywho/x86_64-apple-darwin/libggml-metal.dylib": "", "res://addons/nobodywho/x86_64-apple-darwin/libllama.dylib": "", "res://addons/nobodywho/x86_64-apple-darwin/libllama-common.dylib": "" }
-macos.debug.arm64 = { "res://addons/nobodywho/aarch64-apple-darwin/libggml.dylib": "", "res://addons/nobodywho/aarch64-apple-darwin/libggml-base.dylib": "", "res://addons/nobodywho/aarch64-apple-darwin/libggml-cpu.dylib": "", "res://addons/nobodywho/aarch64-apple-darwin/libggml-metal.dylib": "", "res://addons/nobodywho/aarch64-apple-darwin/libllama.dylib": "", "res://addons/nobodywho/aarch64-apple-darwin/libllama-common.dylib": "" }
-macos.release.arm64 = { "res://addons/nobodywho/aarch64-apple-darwin/libggml.dylib": "", "res://addons/nobodywho/aarch64-apple-darwin/libggml-base.dylib": "", "res://addons/nobodywho/aarch64-apple-darwin/libggml-cpu.dylib": "", "res://addons/nobodywho/aarch64-apple-darwin/libggml-metal.dylib": "", "res://addons/nobodywho/aarch64-apple-darwin/libllama.dylib": "", "res://addons/nobodywho/aarch64-apple-darwin/libllama-common.dylib": "" }
+macos.debug = { "res://addons/nobodywho/apple-darwin/libggml.dylib": "", "res://addons/nobodywho/apple-darwin/libggml-base.dylib": "", "res://addons/nobodywho/apple-darwin/libggml-cpu.dylib": "", "res://addons/nobodywho/apple-darwin/libggml-metal.dylib": "", "res://addons/nobodywho/apple-darwin/libllama.dylib": "", "res://addons/nobodywho/apple-darwin/libllama-common.dylib": "" }
+macos.release = { "res://addons/nobodywho/apple-darwin/libggml.dylib": "", "res://addons/nobodywho/apple-darwin/libggml-base.dylib": "", "res://addons/nobodywho/apple-darwin/libggml-cpu.dylib": "", "res://addons/nobodywho/apple-darwin/libggml-metal.dylib": "", "res://addons/nobodywho/apple-darwin/libllama.dylib": "", "res://addons/nobodywho/apple-darwin/libllama-common.dylib": "" }
 android.debug.arm64 = { "res://addons/nobodywho/aarch64-linux-android/libggml.so": "", "res://addons/nobodywho/aarch64-linux-android/libggml-base.so": "", "res://addons/nobodywho/aarch64-linux-android/libggml-cpu.so": "", "res://addons/nobodywho/aarch64-linux-android/libllama.so": "", "res://addons/nobodywho/aarch64-linux-android/libllama-common.so": "" }
 android.release.arm64 = { "res://addons/nobodywho/aarch64-linux-android/libggml.so": "", "res://addons/nobodywho/aarch64-linux-android/libggml-base.so": "", "res://addons/nobodywho/aarch64-linux-android/libggml-cpu.so": "", "res://addons/nobodywho/aarch64-linux-android/libllama.so": "", "res://addons/nobodywho/aarch64-linux-android/libllama-common.so": "" }
 

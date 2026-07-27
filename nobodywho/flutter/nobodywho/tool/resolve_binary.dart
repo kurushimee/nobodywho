@@ -337,14 +337,18 @@ Future<String> downloadLibrary(Config config, String version) async {
     // and saved back under their base name (matching the binding's rpath / SONAME).
     final ext = libName.split('.').last;
     final prefix = config.platform == 'windows' ? '' : 'lib';
-    // Map: lib base name -> is a 404 tolerable? Optional: ggml-vulkan (not on Android),
-    // onnxruntime (x86_64 android only; elsewhere ORT is static). The rest are DT_NEEDED
-    // of the binding, so a missing/truncated one must fail, not be silently skipped.
+    // Map: lib base name -> is a 404 tolerable? Optional: onnxruntime (x86_64 android
+    // only; elsewhere ORT is static), and ggml-vulkan on Android only — Android is
+    // CPU-only, but on linux/windows ggml-vulkan is a DT_NEEDED of libggml, so a
+    // missing one there must fail rather than surface as a load error on the user's
+    // machine. The rest are DT_NEEDED of the binding everywhere.
+    // (This path never serves Apple platforms — those take the xcframework branch.)
+    final vulkanOptional = config.platform == 'android';
     final siblingLibs = <String, bool>{
       '${prefix}ggml': false,
       '${prefix}ggml-base': false,
       '${prefix}ggml-cpu': false,
-      '${prefix}ggml-vulkan': true,
+      '${prefix}ggml-vulkan': vulkanOptional,
       '${prefix}onnxruntime': true,
       '${prefix}llama': false,
       '${prefix}llama-common': false,

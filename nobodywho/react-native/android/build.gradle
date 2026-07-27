@@ -132,8 +132,15 @@ task resolveNativeLibraries {
         // statically), so it is optional — absent for the arm64 triple.
         downloadAsset("libonnxruntime-${triple}.so", new File(abiDir, "libonnxruntime.so"), false)
       } catch (GradleException e) {
+        // Leaving the binding behind would poison the cache: the libFile.exists()
+        // fast path above skips every download for this ABI on the next build, so a
+        // jniLibs/<abi> missing its ggml siblings would get packaged silently
+        // (UnsatisfiedLinkError on device). resolve_binary.dart wipes the binding in
+        // its outer catch for the same reason.
+        if (libFile.exists()) libFile.delete()
         throw e
       } catch (Exception e) {
+        if (libFile.exists()) libFile.delete()
         throw new GradleException(
           "Failed to download NobodyWho libraries for ${abi}: ${e.message}\n" +
           "For local development, build the uniffi crate and place the .so files at: ${abiDir}",

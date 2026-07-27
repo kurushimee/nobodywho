@@ -405,6 +405,49 @@ jobs:
           name: nobodywho-flutter-xcframework
           path: ./nobodywho_flutter.xcframework.zip
 
+  # The Godot addon ships ONE universal ggml/llama set for macOS instead of a per-arch
+  # set. Godot resolves .gdextension [dependencies] by first matching tag set, and the
+  # arch-less macos.debug/macos.release keys always match before macos.*.arm64, so an
+  # arch-split set would pair the arm64 binding with x86_64 dylibs. See the comments in
+  # nobodywho/godot/nobodywho.gdextension.
+  build-godot-macos-universal:
+    if: inputs.full_ci
+    runs-on: warp-macos-15-arm64-6x
+    needs: [cargo-build-macos]
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: "Download macOS godot build artifacts"
+        uses: actions/download-artifact@v5
+        with:
+          # No merge-multiple: generically-named ggml dylibs would collide across arches.
+          pattern: nobodywho-godot-*-apple-darwin-release
+          path: artifacts
+
+      - name: "lipo the ggml/llama dylibs"
+        run: |
+          # release-only: a debug binding loads the release ggml (same ABI), matching
+          # how the release job assembles the addon.
+          bash nobodywho/scripts/lipo-apple-libs.sh \
+            artifacts/nobodywho-godot-aarch64-apple-darwin-release \
+            artifacts/nobodywho-godot-x86_64-apple-darwin-release \
+            universal
+
+          # The release job assembles the addon straight from this artifact, so a
+          # partial set has to fail here — it cannot be detected downstream.
+          for base in libggml libggml-base libggml-cpu libggml-metal libllama libllama-common; do
+            f="universal/$base.dylib"
+            [ -f "$f" ] || { echo "::error::$f missing — a macOS slice did not build it"; exit 1; }
+            lipo -info "$f" | grep -q x86_64 || { echo "::error::$f has no x86_64 slice"; exit 1; }
+            lipo -info "$f" | grep -q arm64  || { echo "::error::$f has no arm64 slice"; exit 1; }
+          done
+
+      - name: "Upload build artifact"
+        uses: actions/upload-artifact@v5
+        with:
+          name: nobodywho-godot-macos-universal-dylibs
+          path: ./universal/*.dylib
+
   # builds an xcframework containing static libraries for React Native iOS
   build-react-native-xcframework:
     if: inputs.full_ci
