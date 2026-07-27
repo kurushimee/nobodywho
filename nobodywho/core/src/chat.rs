@@ -48,7 +48,7 @@ use std::hash::Hasher;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, MutexGuard};
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error, info, trace, warn};
 
 #[derive(Deserialize, Serialize, Clone, PartialEq, Eq, Debug, Hash)]
 pub struct Asset {
@@ -1480,27 +1480,50 @@ impl<'a> Chat<'a> {
     /// Compare tokens from a template-rendered chat history with the tokens in the LLM's context,
     /// and perform the LLM 'reading' to make the LLM's context match the rendered tokens exactly.
     /// Because this invokes the model, this is potentially an expensive method to call.
+    ///
+    /// On recurrent / hybrid-recurrent architectures the render is split into a
+    /// committed portion and a transient generation-prompt tail, with a checkpoint
+    /// saved between so the next sync can rewind instead of a full reset.
     #[tracing::instrument(level = "debug", skip_all)]
     fn sync_context_with_render(
         &mut self,
         inference_lock_token: &MutexGuard<'_, GlobalInferenceLockToken>,
     ) -> Result<(), ContextSyncError> {
-        let mut chunks = self.render_as_chunks(true)?;
-        if chunks.n_tokens() > self.engine.ctx.n_ctx() as usize {
+        let mut full_chunks = self.render_as_chunks(true, true)?;
+        if full_chunks.n_tokens() > self.engine.ctx.n_ctx() as usize {
             self.context_shift()?;
-            chunks = self.render_as_chunks(true)?;
+            full_chunks = self.render_as_chunks(true, true)?;
         }
 
         // We should never try to sync with an empty render
-        debug_assert!(!chunks.is_empty());
+        debug_assert!(!full_chunks.is_empty());
+
+        let (committed_chunks, gen_prompt_tail) = if self.engine.needs_checkpointing() {
+            let committed = self.render_as_chunks(true, false)?;
+            // `committed` must be a token-level prefix of `full` — holds because the
+            // gen prompt opens with an atomic/special token. Verified by the test.
+            let tail = full_chunks.tail(committed.n_tokens());
+            (committed, Some(tail))
+        } else {
+            (full_chunks, None)
+        };
 
         // Diff against the chunks currently in the KV cache and load only the new tail.
         let prev = std::mem::take(&mut self.context.chunks);
-        let new_chunks = self
-            .engine
-            .sync_context(chunks, &prev, inference_lock_token)?;
-        self.context.chunks = new_chunks;
+        let new_committed =
+            self.engine
+                .sync_context(committed_chunks, &prev, inference_lock_token)?;
+        self.context.chunks = new_committed;
         self.context.garbage_collect_bitmaps(&self.messages);
+
+        self.engine.save_checkpoint();
+
+        // Transient tail: read into the KV cache only, not stored in context.chunks.
+        if let Some(tail) = gen_prompt_tail {
+            if tail.n_tokens() > 0 {
+                self.engine.read_chunks(tail, inference_lock_token)?;
+            }
+        }
 
         Ok(())
     }
@@ -1537,7 +1560,7 @@ impl<'a> Chat<'a> {
                 break;
             }
 
-            let chunks = self.render_as_chunks(false)?;
+            let chunks = self.render_as_chunks(false, true)?;
             if chunks.n_tokens() <= target_token_size {
                 break;
             }
@@ -1629,6 +1652,22 @@ impl<'a> Chat<'a> {
                 let deferred_pending = self.engine.take_pending();
                 self.context_shift()?;
                 self.sync_context_with_render(inference_lock_token)?;
+
+                // A shift only reclaims history; the in-progress response can't be
+                // shrunk, so if it already fills the window, stop instead of overflowing.
+                let n_ctx = self.engine.ctx.n_ctx() as usize;
+                let needed = self.engine.n_past() as usize + tokens_written_until_now.n_tokens();
+                if needed >= n_ctx {
+                    warn!(
+                        n_ctx,
+                        n_past = self.engine.n_past(),
+                        in_progress = tokens_written_until_now.n_tokens(),
+                        "Response fills the entire context window after a shift; \
+                         stopping generation early"
+                    );
+                    break;
+                }
+
                 self.engine
                     .read_chunks(tokens_written_until_now.clone(), inference_lock_token)?;
                 self.engine.restore_pending(deferred_pending);
@@ -1831,7 +1870,8 @@ impl<'a> Chat<'a> {
             .is_none_or(|t| !response.contains(t.as_str())));
         self.add_assistant_message(response);
 
-        self.context.chunks = self.render_as_chunks(true)?;
+        // Committed (no-gen-prompt) view for the next sync's diff.
+        self.context.chunks = self.render_as_chunks(true, false)?;
 
         Ok(self)
     }
@@ -1839,7 +1879,11 @@ impl<'a> Chat<'a> {
     /// Go for the unhandled mode when you are context shifting.
     /// That is for avoiding the render will concat system message with the first user message.
     /// Otherwise please handle stuff.
-    fn render_as_chunks(&mut self, handled: bool) -> Result<TokenizerChunks, RenderError> {
+    fn render_as_chunks(
+        &mut self,
+        handled: bool,
+        add_generation_prompt: bool,
+    ) -> Result<TokenizerChunks, RenderError> {
         let messages = &self.messages;
         let template_context = ChatTemplateContext::new(
             self.template_variables.clone(),
@@ -1851,10 +1895,14 @@ impl<'a> Chat<'a> {
         );
 
         let rendered_chat = if handled {
-            self.chat_template.render(messages, &template_context)?
-        } else {
             self.chat_template
-                .render_unhandled(messages, &template_context)?
+                .render(messages, &template_context, add_generation_prompt)?
+        } else {
+            self.chat_template.render_unhandled(
+                messages,
+                &template_context,
+                add_generation_prompt,
+            )?
         };
 
         let bitmaps: Vec<&MtmdBitmap> = self
@@ -2229,6 +2277,124 @@ mod tests {
         Ok(())
     }
 
+    /// Regression guard: with thinking enabled, each turn on Qwen3.5 must hit the
+    /// checkpoint restore path — the stripped `<think>` block forces a rewind —
+    /// otherwise it silently degraded to full resets. Skipped unless
+    /// `TEST_RECURRENT_MODEL` is set.
+    #[test]
+    fn test_checkpoint_restore_fires_on_recurrent_model() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tracing::field::{Field, Visit};
+        use tracing::{Event, Subscriber};
+        use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
+        let Ok(model_path) = std::env::var("TEST_RECURRENT_MODEL") else {
+            eprintln!(
+                "skipping test_checkpoint_restore_fires_on_recurrent_model: \
+                 set TEST_RECURRENT_MODEL to a recurrent-hybrid gguf to enable"
+            );
+            return Ok(());
+        };
+
+        /// Layer that counts tracing events whose message contains a substring.
+        struct MessageMatchCounter {
+            substring: &'static str,
+            count: Arc<AtomicUsize>,
+        }
+        impl<S: Subscriber> Layer<S> for MessageMatchCounter {
+            fn on_event(&self, event: &Event<'_>, _: Context<'_, S>) {
+                struct MsgVisitor<'a> {
+                    substring: &'a str,
+                    matched: bool,
+                }
+                impl<'a> Visit for MsgVisitor<'a> {
+                    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                        if field.name() == "message"
+                            && format!("{value:?}").contains(self.substring)
+                        {
+                            self.matched = true;
+                        }
+                    }
+                }
+                let mut v = MsgVisitor {
+                    substring: self.substring,
+                    matched: false,
+                };
+                event.record(&mut v);
+                if v.matched {
+                    self.count.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+
+        let restores = Arc::new(AtomicUsize::new(0));
+        let subscriber = tracing_subscriber::registry().with(MessageMatchCounter {
+            substring: "Restored from checkpoint",
+            count: Arc::clone(&restores),
+        });
+
+        let model = Arc::new(crate::llm::get_model(&model_path, true, None, None, None)?);
+        tracing::subscriber::with_default(subscriber, || {
+            let mut chat = Chat::new_chat_worker(
+                &model,
+                ChatConfig {
+                    n_ctx: 4096,
+                    template_variables: [("enable_thinking".to_string(), true)].into(),
+                    ..ChatConfig::default()
+                },
+                Arc::new(AtomicBool::new(false)),
+            )
+            .expect("chat init");
+
+            let noop = |_: llm::WriteOutput| {};
+            for prompt in [
+                "What is the capital of France?",
+                "What is the capital of Germany?",
+                "What is the capital of Denmark?",
+            ] {
+                chat.ask(prompt.into(), noop).expect("ask");
+            }
+
+            // Guard the token-prefix invariant the recurrent split relies on. Append a
+            // user turn first, else both renders omit the gen prompt and the check is vacuous.
+            chat.messages.push(Message::new_user(
+                "What is the capital of Norway?".to_string(),
+            ));
+            let without = chat
+                .render_as_chunks(true, false)
+                .expect("render without gen prompt")
+                .to_token_ids();
+            let with = chat
+                .render_as_chunks(true, true)
+                .expect("render with gen prompt")
+                .to_token_ids();
+            // Non-vacuous: the gen prompt must actually add tokens here.
+            assert!(
+                with.len() > without.len(),
+                "expected a non-empty generation-prompt tail for a user-turn render \
+                 (with={}, without={})",
+                with.len(),
+                without.len()
+            );
+            assert!(
+                with.starts_with(&without),
+                "no-gen-prompt render must be a token-level prefix of the gen-prompt \
+                 render (gen prompt should begin with an atomic token)"
+            );
+        });
+
+        let n = restores.load(Ordering::Relaxed);
+        assert!(
+            n > 0,
+            "no `Restored from checkpoint` events observed on {} — \
+             either the model is not actually recurrent-hybrid, \
+             or the checkpoint restore path has silently regressed",
+            model_path,
+        );
+        Ok(())
+    }
+
     #[test]
     fn test_reset_chat() -> Result<(), Box<dyn std::error::Error>> {
         // test_utils::init_test_tracing();
@@ -2574,7 +2740,7 @@ mod tests {
         }
 
         // 5. Verify token count is within target
-        let token_count = worker.render_as_chunks(true)?.len();
+        let token_count = worker.render_as_chunks(true, true)?.len();
 
         let target_size = (n_ctx / 2) as usize;
         assert!(
@@ -2688,7 +2854,7 @@ mod tests {
         }
 
         // 5. Verify token count is within target
-        let token_count = worker.render_as_chunks(true)?.len();
+        let token_count = worker.render_as_chunks(true, true)?.len();
 
         let target_size = (n_ctx / 2) as usize;
         assert!(
