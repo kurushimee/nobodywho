@@ -16,7 +16,8 @@ Format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/
 
 ### Changed
 
-- Tool calling now uses Lark grammars with the llguidance sampler instead of GBNF, making tool-constrained generation noticeably faster — especially on large-vocabulary models — and pre-builds the tool-call sampler so the first tool-enabled response no longer stalls while the grammar compiles. No API changes. Available for all bindings.
+- Tool calling now uses Lark grammars with the llguidance sampler instead of GBNF, making tool-constrained generation noticeably faster — especially on large-vocabulary models — and pre-builds the tool-call sampler so the first tool-enabled response no longer stalls while the grammar compiles. Available for all bindings.
+- **Behavior change:** creating a chat with tools on a model whose tool-call format cannot be detected now fails at setup instead of silently falling back to unconstrained (unreliable) tool calling. Chats created without tools are unaffected. Available for all bindings.
 - **React Native:** `STT` now takes a named options object. Replace `new STT(source, language, quantization)` with `new STT({ source, language, quantization })`.
 
 ## [Python v1.6.0, Flutter v2.4.0, Godot v9.5.0, Kotlin v2.1.0, React Native v2.4.0, Swift v2.2.0] - 2026-07-13
