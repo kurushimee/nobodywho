@@ -35,13 +35,21 @@ install_name_tool -id "@rpath/$FW_NAME.framework/$FW_NAME" "$ROOT/$FW_NAME"
 install_name_tool -add_rpath "@loader_path" "$ROOT/$FW_NAME" 2>/dev/null || true
 
 # Embed the ggml/llama dylibs. cp -L dereferences any stray symlink to a real file.
+embedded=0
 for real in "$SRC_DIR"/libggml*.dylib "$SRC_DIR"/libllama*.dylib; do
     [ -e "$real" ] || continue
     name=$(basename "$real")
     cp -L "$real" "$ROOT/$name"
     install_name_tool -id "@rpath/$FW_NAME.framework/$name" "$ROOT/$name" 2>/dev/null || true
     install_name_tool -add_rpath "@loader_path" "$ROOT/$name" 2>/dev/null || true
+    embedded=$((embedded + 1))
 done
+# The binary @rpath-references these, so a framework built without them loads nowhere.
+# Fail here rather than ship a framework that only fails on the consumer's machine.
+if [ "$embedded" -eq 0 ]; then
+    echo "make-apple-framework: no libggml*/libllama* dylibs found in $SRC_DIR" >&2
+    exit 1
+fi
 
 # optional uniffi FFI module
 if [ -n "$FFI_HEADER" ]; then

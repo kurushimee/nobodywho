@@ -430,36 +430,64 @@ jobs:
         run: ls -la artifacts/
 
       # Place Android native libs for the AAR; the loader resolves NEEDED libs from jniLibs/<abi>.
+      # The trailing filenames are the ggml/llama siblings that MUST be present: they are
+      # NEEDED entries of the binding, and neither the AAR nor the darwin/win32 JARs have a
+      # downstream smoke test, so a build regression that drops one has to fail here rather
+      # than reach users as an UnsatisfiedLinkError.
       - name: "Setup Android jniLibs"
         run: |
+          set -euo pipefail
+          shopt -s nullglob
           mkdir -p nobodywho/kotlin/android/build/jniLibs/{arm64-v8a,x86_64}
-          place_android() { # $1=target $2=abi
+          place_android() { # $1=target $2=abi $3...=required sibling filenames
             local d="artifacts/nobodywho-uniffi-$1-release"
-            cp "$d/libnobodywho-uniffi-$1-release.so" \
-              "nobodywho/kotlin/android/build/jniLibs/$2/libnobodywho_uniffi.so"
+            local dest="nobodywho/kotlin/android/build/jniLibs/$2"
+            cp "$d/libnobodywho-uniffi-$1-release.so" "$dest/libnobodywho_uniffi.so"
+            # nullglob: an empty set would make cp bail with a usage error instead of the
+            # per-file diagnostic below, so only copy what matched.
+            local libs=("$d"/libggml*.so "$d"/libllama*.so)
+            [ ${#libs[@]} -eq 0 ] || cp -P "${libs[@]}" "$dest/"
             # libonnxruntime.so ships for x86_64 only (arm64 links ORT statically).
-            cp -P "$d"/libggml*.so "$d"/libllama*.so "$d"/libonnxruntime*.so "nobodywho/kotlin/android/build/jniLibs/$2/" 2>/dev/null || true
+            local ort=("$d"/libonnxruntime*.so)
+            [ ${#ort[@]} -eq 0 ] || cp -P "${ort[@]}" "$dest/"
+            local abi=$2; shift 2
+            for f in "$@"; do
+              [ -f "$dest/$f" ] || { echo "::error::$f missing from $d ($abi AAR)"; exit 1; }
+            done
           }
-          place_android aarch64-linux-android arm64-v8a
-          place_android x86_64-linux-android  x86_64
+          ANDROID_LIBS=(libggml.so libggml-base.so libggml-cpu.so libllama.so libllama-common.so)
+          place_android aarch64-linux-android arm64-v8a "${ANDROID_LIBS[@]}"
+          place_android x86_64-linux-android  x86_64    "${ANDROID_LIBS[@]}"
 
       # Place desktop native libs for the JVM JAR (JNA layout): the binding lib plus its
       # co-located ggml/llama siblings, staged at load time by the `common` NativeLoader
       # (see nobodywho/kotlin/common/src/NativeLoader.kt).
       - name: "Setup JVM native libs"
         run: |
+          set -euo pipefail
+          shopt -s nullglob
           mkdir -p nobodywho/kotlin/jvm/src/main/resources/{linux-x86-64,linux-aarch64,darwin-aarch64,win32-x86-64}
-          place_jvm() { # $1=target $2=jna-dir $3=libname
+          place_jvm() { # $1=target $2=jna-dir $3=libname $4=ext $5...=required sibling filenames
             local d="artifacts/nobodywho-uniffi-$1-release"
-            cp "$d/libnobodywho-uniffi-$1-release.$4" \
-              "nobodywho/kotlin/jvm/src/main/resources/$2/$3"
-            cp -P "$d"/libggml* "$d"/libllama* "$d"/ggml* "$d"/llama* \
-              "nobodywho/kotlin/jvm/src/main/resources/$2/" 2>/dev/null || true
+            local dest="nobodywho/kotlin/jvm/src/main/resources/$2"
+            cp "$d/libnobodywho-uniffi-$1-release.$4" "$dest/$3"
+            # nullglob: see place_android — copy only what matched so the per-file check reports.
+            local libs=("$d"/libggml* "$d"/libllama* "$d"/ggml* "$d"/llama*)
+            [ ${#libs[@]} -eq 0 ] || cp -P "${libs[@]}" "$dest/"
+            local jna_dir=$2; shift 4
+            for f in "$@"; do
+              [ -f "$dest/$f" ] || { echo "::error::$f missing from $d ($jna_dir JAR)"; exit 1; }
+            done
           }
-          place_jvm x86_64-unknown-linux-gnu  linux-x86-64   libnobodywho_uniffi.so    so
-          place_jvm aarch64-unknown-linux-gnu linux-aarch64  libnobodywho_uniffi.so    so
-          place_jvm aarch64-apple-darwin      darwin-aarch64 libnobodywho_uniffi.dylib dylib
-          place_jvm x86_64-pc-windows-msvc    win32-x86-64   nobodywho_uniffi.dll      dll
+          # Vulkan on linux/windows, Metal on macOS — see the target cfg blocks in core/Cargo.toml.
+          place_jvm x86_64-unknown-linux-gnu  linux-x86-64   libnobodywho_uniffi.so    so \
+            libggml.so libggml-base.so libggml-cpu.so libggml-vulkan.so libllama.so libllama-common.so
+          place_jvm aarch64-unknown-linux-gnu linux-aarch64  libnobodywho_uniffi.so    so \
+            libggml.so libggml-base.so libggml-cpu.so libggml-vulkan.so libllama.so libllama-common.so
+          place_jvm aarch64-apple-darwin      darwin-aarch64 libnobodywho_uniffi.dylib dylib \
+            libggml.dylib libggml-base.dylib libggml-cpu.dylib libggml-metal.dylib libllama.dylib libllama-common.dylib
+          place_jvm x86_64-pc-windows-msvc    win32-x86-64   nobodywho_uniffi.dll      dll \
+            ggml.dll ggml-base.dll ggml-cpu.dll ggml-vulkan.dll llama.dll llama-common.dll
 
       - name: "Setup JDK"
         uses: actions/setup-java@v5

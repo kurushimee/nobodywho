@@ -66,11 +66,19 @@ jobs:
       # Bundle the binding + ggml/llama siblings into the JVM JAR resources (JNA layout), mirroring release.
       - name: "Bundle native libs into JVM JAR resources"
         run: |
+          set -euo pipefail
+          shopt -s nullglob
           d=./native-lib
-          mkdir -p nobodywho/kotlin/jvm/src/main/resources/linux-x86-64
-          cp "$d/libnobodywho_uniffi.so" nobodywho/kotlin/jvm/src/main/resources/linux-x86-64/
-          cp -P "$d"/libggml* "$d"/libllama* \
-            nobodywho/kotlin/jvm/src/main/resources/linux-x86-64/ 2>/dev/null || true
+          dest=nobodywho/kotlin/jvm/src/main/resources/linux-x86-64
+          mkdir -p "$dest"
+          cp "$d/libnobodywho_uniffi.so" "$dest/"
+          libs=("$d"/libggml* "$d"/libllama*)
+          [ ${#libs[@]} -eq 0 ] || cp -P "${libs[@]}" "$dest/"
+          # jvmSmoke below would catch a missing sibling as an UnsatisfiedLinkError; assert
+          # here so the failure names the missing file instead. Mirrors release.yml.
+          for f in libggml.so libggml-base.so libggml-cpu.so libggml-vulkan.so libllama.so libllama-common.so; do
+            [ -f "$dest/$f" ] || { echo "::error::$f missing from the uniffi build artifact"; exit 1; }
+          done
 
       # Load the packaged JAR the way a real consumer does — no NOBODYWHO_LIB_DIR /
       # jna.library.path shim — so the NativeLoader must resolve the sibling libs from the

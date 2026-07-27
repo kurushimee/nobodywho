@@ -9,7 +9,15 @@ set -euo pipefail
 A=$1; B=$2; OUT=$3
 mkdir -p "$OUT"
 shopt -s nullglob
+n=0
 for f in "$A"/libggml*.dylib "$A"/libllama*.dylib; do
     b=$(basename "$f")
     lipo -create "$f" "$B/$b" -output "$OUT/$b"
+    n=$((n + 1))
 done
+# nullglob makes an empty $A a silent no-op, which downstream shows up as a framework
+# with no embedded ggml — i.e. a load failure on the consumer's machine, not here.
+if [ "$n" -eq 0 ]; then
+    echo "lipo-apple-libs: no libggml*/libllama* dylibs found in $A" >&2
+    exit 1
+fi
