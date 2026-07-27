@@ -244,7 +244,12 @@ jobs:
           for d in artifacts/nobodywho-flutter-*-release/; do
             name=$(basename "$d"); triple=${name#nobodywho-flutter-}; triple=${triple%-release}
             [ "$triple" = "xcframework" ] && continue
-            cp "$d"/libnobodywho-flutter-"$triple"-release.* "$OUT/" 2>/dev/null || true
+            # Apple triples ship inside the xcframework zip above. Publishing their bare
+            # .dylib here would emit an asset nothing downloads (resolve_binary.dart takes
+            # the xcframework branch for ios/macos) and that cannot load anyway, since the
+            # sibling loop below only globs .so/.dll.
+            case "$triple" in *-apple-*) continue ;; esac
+            cp "$d"/libnobodywho-flutter-"$triple"-release.* "$OUT/"
             for f in "$d"/libggml*.so "$d"/libllama*.so "$d"/ggml*.dll "$d"/llama*.dll "$d"/libonnxruntime*.so; do
               [ -e "$f" ] || continue
               b=$(basename "$f"); stem=${b%.*}; ext=${b##*.}
