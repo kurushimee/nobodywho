@@ -245,6 +245,14 @@ pub struct ChatConfig {
     /// efficiency cores slow down ggml's per-node thread barrier. Set it lower to leave CPU
     /// headroom for other work. Values are clamped to the logical CPU count.
     pub n_threads: Option<u32>,
+    /// Hard cap on tokens generated per response. `0` (the default) means unlimited:
+    /// generation ends only on an end-of-generation token or `stop_generation()`.
+    pub max_response_tokens: u32,
+    /// Feed the rendered context (system prompt + chat history) into the sampler before
+    /// generating, so repetition penalties and DRY see it rather than only the response
+    /// being written. Skipped automatically while a grammar constrains sampling —
+    /// accepting tokens into a grammar sampler crashes (llama-cpp-rs#604). Off by default.
+    pub accept_context: bool,
 }
 
 impl Default for ChatConfig {
@@ -257,6 +265,8 @@ impl Default for ChatConfig {
             sampler_config: None,
             mtp: None,
             n_threads: None,
+            max_response_tokens: 0,
+            accept_context: false,
         }
     }
 }
@@ -568,6 +578,35 @@ impl ChatHandle {
         })
         .ok_or(crate::errors::SetterError::SetterError(
             "set_sampler_config".into(),
+        ))
+    }
+
+    /// Cap the number of tokens generated per response. `0` means unlimited.
+    pub fn set_max_response_tokens(
+        &self,
+        max_response_tokens: u32,
+    ) -> Result<(), crate::errors::SetterError> {
+        self.set_and_wait_blocking(|output_tx| ChatMsg::SetMaxResponseTokens {
+            max_response_tokens,
+            output_tx,
+        })
+        .ok_or(crate::errors::SetterError::SetterError(
+            "set_max_response_tokens".into(),
+        ))
+    }
+
+    /// Feed the rendered context into the sampler before generating, so repetition
+    /// penalties and DRY see the prompt and chat history. Skipped under grammar sampling.
+    pub fn set_accept_context(
+        &self,
+        accept_context: bool,
+    ) -> Result<(), crate::errors::SetterError> {
+        self.set_and_wait_blocking(|output_tx| ChatMsg::SetAcceptContext {
+            accept_context,
+            output_tx,
+        })
+        .ok_or(crate::errors::SetterError::SetterError(
+            "set_accept_context".into(),
         ))
     }
 
@@ -892,6 +931,37 @@ impl ChatHandleAsync {
         ))
     }
 
+    /// Cap the number of tokens generated per response. `0` means unlimited.
+    pub async fn set_max_response_tokens(
+        &self,
+        max_response_tokens: u32,
+    ) -> Result<(), crate::errors::SetterError> {
+        self.set_and_wait_async(|output_tx| ChatMsg::SetMaxResponseTokens {
+            max_response_tokens,
+            output_tx,
+        })
+        .await
+        .ok_or(crate::errors::SetterError::SetterError(
+            "set_max_response_tokens".into(),
+        ))
+    }
+
+    /// Feed the rendered context into the sampler before generating, so repetition
+    /// penalties and DRY see the prompt and chat history. Skipped under grammar sampling.
+    pub async fn set_accept_context(
+        &self,
+        accept_context: bool,
+    ) -> Result<(), crate::errors::SetterError> {
+        self.set_and_wait_async(|output_tx| ChatMsg::SetAcceptContext {
+            accept_context,
+            output_tx,
+        })
+        .await
+        .ok_or(crate::errors::SetterError::SetterError(
+            "set_accept_context".into(),
+        ))
+    }
+
     /// Stop the current generation if one is in progress.
     pub fn stop_generation(&self) {
         self.guard.stop();
@@ -1113,6 +1183,14 @@ enum ChatMsg {
         sampler_config: SamplerConfig,
         output_tx: tokio::sync::mpsc::Sender<()>,
     },
+    SetMaxResponseTokens {
+        max_response_tokens: u32,
+        output_tx: tokio::sync::mpsc::Sender<()>,
+    },
+    SetAcceptContext {
+        accept_context: bool,
+        output_tx: tokio::sync::mpsc::Sender<()>,
+    },
     GetChatHistory {
         output_tx: tokio::sync::mpsc::Sender<Vec<Message>>,
     },
@@ -1174,6 +1252,17 @@ impl std::fmt::Debug for ChatMsg {
             ChatMsg::SetSamplerConfig { sampler_config, .. } => f
                 .debug_struct("SetSamplerConfig")
                 .field("sampler_config", sampler_config)
+                .finish(),
+            ChatMsg::SetMaxResponseTokens {
+                max_response_tokens,
+                ..
+            } => f
+                .debug_struct("SetMaxResponseTokens")
+                .field("max_response_tokens", max_response_tokens)
+                .finish(),
+            ChatMsg::SetAcceptContext { accept_context, .. } => f
+                .debug_struct("SetAcceptContext")
+                .field("accept_context", accept_context)
                 .finish(),
             ChatMsg::GetChatHistory { .. } => f.debug_struct("GetChatHistory").finish(),
             ChatMsg::SetChatHistory { messages, .. } => f
@@ -1266,6 +1355,20 @@ fn process_worker_msg(worker_state: &mut Chat<'_>, msg: ChatMsg) -> Result<(), C
             output_tx,
         } => {
             worker_state.set_sampler_config(sampler_config);
+            let _ = output_tx.blocking_send(());
+        }
+        ChatMsg::SetMaxResponseTokens {
+            max_response_tokens,
+            output_tx,
+        } => {
+            worker_state.max_response_tokens = max_response_tokens;
+            let _ = output_tx.blocking_send(());
+        }
+        ChatMsg::SetAcceptContext {
+            accept_context,
+            output_tx,
+        } => {
+            worker_state.accept_context = accept_context;
             let _ = output_tx.blocking_send(());
         }
         ChatMsg::GetChatHistory { output_tx } => {
@@ -1392,6 +1495,8 @@ struct Chat<'a> {
     tools: Vec<Tool>,
     chat_template: ChatTemplate,
     context: ChatContext,
+    max_response_tokens: u32,
+    accept_context: bool,
 }
 
 impl<'a> Chat<'a> {
@@ -1461,6 +1566,8 @@ impl<'a> Chat<'a> {
             template_variables: config.template_variables,
             tools: config.tools,
             context: ChatContext::new(),
+            max_response_tokens: config.max_response_tokens,
+            accept_context: config.accept_context,
         })
     }
 
@@ -1636,8 +1743,30 @@ impl<'a> Chat<'a> {
         // stateful samplers only live for one response
         let mut sampler = sampler_config.to_stateful(self.engine.ctx.model)?;
 
+        // Optionally warm the sampler with the rendered context, so repetition
+        // penalties and DRY see the prompt and chat history rather than only the
+        // response being written. Grammar samplers crash on accept
+        // (https://github.com/utilityai/llama-cpp-rs/issues/604), so any grammar
+        // step — including the tool grammar — disables the warmup.
+        let has_grammar = self.tool_grammar.is_some()
+            || sampler_config
+                .steps
+                .iter()
+                .any(|step| matches!(step, crate::sampler::ShiftStep::Grammar { .. }));
+        if self.accept_context && !has_grammar {
+            for chunk in self.context.chunks.iter() {
+                if let TokenizerChunk::Text(tokens, _) = chunk {
+                    for token in tokens {
+                        sampler.accept(*token);
+                    }
+                }
+            }
+        }
+
         // init statefull decoder for split up tokens like emojis
         let mut decoder = encoding_rs::UTF_8.new_decoder();
+
+        let mut emitted_tokens: u32 = 0;
 
         while !self.should_stop() {
             // Check if the context is full
@@ -1705,6 +1834,7 @@ impl<'a> Chat<'a> {
                     full_response.push_str(&token_str);
                     trace!(?token_str, "Sending out token:");
                     respond(WriteOutput::Token(token_str.to_string()));
+                    emitted_tokens += 1;
                 }
 
                 if has_eog {
@@ -1714,6 +1844,11 @@ impl<'a> Chat<'a> {
             }
 
             if hit_eog {
+                break;
+            }
+
+            if self.max_response_tokens > 0 && emitted_tokens >= self.max_response_tokens {
+                debug!(emitted_tokens, "Hit max_response_tokens, ending the response");
                 break;
             }
         }

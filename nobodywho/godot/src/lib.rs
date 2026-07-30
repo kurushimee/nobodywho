@@ -678,6 +678,19 @@ struct NobodyWhoChat {
     /// `p_min`). Only used when `mtp` is enabled.
     mtp_p_min: f32,
 
+    #[export]
+    #[var(get = get_max_response_tokens, set = set_max_response_tokens)]
+    /// Hard cap on tokens generated per response. 0 means unlimited: generation ends
+    /// only on an end-of-generation token or `stop_generation()`.
+    max_response_tokens: u32,
+
+    #[export]
+    #[var(get = get_accept_context, set = set_accept_context)]
+    /// Feed the system prompt and chat history into the sampler before generating, so
+    /// repetition penalties and DRY see them rather than only the response being written.
+    /// Automatically skipped while a grammar constrains sampling.
+    accept_context: bool,
+
     // internal state
     chat_handle: Option<nobodywho::chat::ChatHandleAsync>,
     tools: Vec<nobodywho::tool_calling::Tool>,
@@ -706,6 +719,8 @@ impl INode for NobodyWhoChat {
             mtp: default_config.mtp.is_some(),
             mtp_k_max: mtp_defaults.k_max,
             mtp_p_min: mtp_defaults.p_min,
+            max_response_tokens: default_config.max_response_tokens,
+            accept_context: default_config.accept_context,
 
             // config
             model_node: None,
@@ -727,6 +742,8 @@ struct ChatWorkerConfig {
     n_threads: Option<u32>,
     allow_thinking: bool,
     mtp: Option<nobodywho::chat::MtpConfig>,
+    max_response_tokens: u32,
+    accept_context: bool,
 }
 
 #[godot_api]
@@ -758,6 +775,8 @@ impl NobodyWhoChat {
                 sampler_config: None,
                 mtp: config.mtp,
                 n_threads: config.n_threads,
+                max_response_tokens: config.max_response_tokens,
+                accept_context: config.accept_context,
             },
         )
         .map_err(|e| GString::from(e.to_string().as_str()))?;
@@ -795,6 +814,8 @@ impl NobodyWhoChat {
             n_threads: (self.thread_count > 0).then_some(self.thread_count),
             allow_thinking: self.allow_thinking,
             mtp,
+            max_response_tokens: self.max_response_tokens,
+            accept_context: self.accept_context,
         })
     }
 
@@ -968,6 +989,50 @@ impl NobodyWhoChat {
                     .await;
                 if let Err(msg) = result {
                     godot_warn!("Error setting allow_thinking: {}", msg);
+                }
+            });
+        }
+    }
+
+    #[func]
+    fn get_max_response_tokens(&mut self) -> u32 {
+        self.max_response_tokens
+    }
+
+    #[func]
+    fn set_max_response_tokens(&mut self, max_response_tokens: u32) {
+        // always mutate local state
+        self.max_response_tokens = max_response_tokens;
+
+        // if worker is running, also inform that
+        if let Some(chat_handle) = self.chat_handle.as_ref() {
+            let handle_clone = chat_handle.clone();
+            godot::task::spawn(async move {
+                let result = handle_clone.set_max_response_tokens(max_response_tokens).await;
+                if let Err(msg) = result {
+                    godot_warn!("Error setting max_response_tokens: {}", msg);
+                }
+            });
+        }
+    }
+
+    #[func]
+    fn get_accept_context(&mut self) -> bool {
+        self.accept_context
+    }
+
+    #[func]
+    fn set_accept_context(&mut self, accept_context: bool) {
+        // always mutate local state
+        self.accept_context = accept_context;
+
+        // if worker is running, also inform that
+        if let Some(chat_handle) = self.chat_handle.as_ref() {
+            let handle_clone = chat_handle.clone();
+            godot::task::spawn(async move {
+                let result = handle_clone.set_accept_context(accept_context).await;
+                if let Err(msg) = result {
+                    godot_warn!("Error setting accept_context: {}", msg);
                 }
             });
         }

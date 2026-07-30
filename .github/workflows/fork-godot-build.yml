@@ -1,0 +1,115 @@
+name: "Fork Godot Build"
+# Fork-only build: the upstream Build workflow is workflow_call-only and its Linux
+# jobs run on Warp runners that do not exist on forks. This dispatchable workflow
+# builds just the godot integration for the two targets this fork ships, on
+# standard GitHub runners, mirroring the upstream steps.
+on:
+  workflow_dispatch:
+
+jobs:
+  godot-linux-x86_64:
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "-C target-cpu=x86-64-v3"
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: "Cache Cargo Home"
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo
+            nobodywho/target
+          key: ${{ runner.os }}-cargo-home-godot-x86_64-unknown-linux-gnu-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-home-godot-x86_64-unknown-linux-gnu-release-
+
+      - name: "Setup rust toolchain"
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          . "$HOME/.cargo/env"
+          rustup update stable
+          rustup default stable
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: "Install Vulkan dependencies"
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libclang-dev cmake
+          sudo apt-get install libshaderc-dev libvulkan-dev glslc
+
+      - name: "Compile for linux"
+        run: cargo build -p nobodywho-godot --verbose --target x86_64-unknown-linux-gnu --release --locked
+        working-directory: ./nobodywho
+
+      - name: "Rename built file"
+        run: cp ./nobodywho/target/x86_64-unknown-linux-gnu/release/libnobodywho_godot.so ./libnobodywho-godot-x86_64-unknown-linux-gnu-release.so
+
+      - name: "Upload build artifact"
+        uses: actions/upload-artifact@v5
+        with:
+          name: nobodywho-godot-x86_64-unknown-linux-gnu-release
+          path: ./libnobodywho-godot-x86_64-unknown-linux-gnu-release.so
+
+  godot-windows-x86_64:
+    runs-on: windows-latest
+    env:
+      # Fetch git deps with the git CLI: libgit2 ignores core.longpaths, and the
+      # deeply nested llama.cpp paths blow past Windows' 260-char MAX_PATH.
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: "Cache Cargo Home"
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo
+          key: ${{ runner.os }}-cargo-home-godot-x86_64-pc-windows-msvc-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-home-godot-x86_64-pc-windows-msvc-release-
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          target: x86_64-pc-windows-msvc
+
+      - name: Install Vulkan SDK
+        uses: jakoch/install-vulkan-sdk-action@v1.2.5
+        with:
+          # 1.4.313.2 matches llama.cpp's own Windows Vulkan CI; older SDKs lack
+          # the SPIRV-Headers cmake config the ggml-vulkan backend requires.
+          vulkan_version: 1.4.313.2
+          cache: true
+          install_runtime: true
+          stripdown: true
+
+      - name: Install Ninja
+        run: choco install ninja
+
+      - name: Build with Cargo
+        # Move sources into a shortly-named dir to dodge Windows path limits.
+        run: |
+          mv ./nobodywho/* C:/
+          New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force
+          git config --system core.longpaths true
+          cd C:/
+          cargo build -p nobodywho-godot --target x86_64-pc-windows-msvc --verbose --release --locked --target-dir C:/t
+        env:
+          NOBODYWHO_SKIP_CODEGEN: "1"
+          RUSTFLAGS: >-
+            -l Advapi32
+            -C target-cpu=x86-64-v3
+            -C debuginfo=0
+          # Ninja avoids a CMake ExternalProject issue with the VS generator.
+          CMAKE_GENERATOR: "Ninja"
+
+      - name: "Rename built files"
+        run: cp C:/t/x86_64-pc-windows-msvc/release/nobodywho_godot.dll ./libnobodywho-godot-x86_64-pc-windows-msvc-release.dll
+
+      - name: "Upload build artifacts"
+        uses: actions/upload-artifact@v5
+        with:
+          name: nobodywho-godot-x86_64-pc-windows-msvc-release
+          path: ./libnobodywho-godot-x86_64-pc-windows-msvc-release.dll
