@@ -1754,13 +1754,16 @@ impl<'a> Chat<'a> {
                 .iter()
                 .any(|step| matches!(step, crate::sampler::ShiftStep::Grammar { .. }));
         if self.accept_context && !has_grammar {
+            let mut accepted: usize = 0;
             for chunk in self.context.chunks.iter() {
                 if let TokenizerChunk::Text(tokens, _) = chunk {
                     for token in tokens {
                         sampler.accept(*token);
+                        accepted += 1;
                     }
                 }
             }
+            info!(accepted, "Warmed sampler with context tokens");
         }
 
         // init statefull decoder for split up tokens like emojis
