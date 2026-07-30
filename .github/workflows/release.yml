@@ -73,8 +73,10 @@ jobs:
               cp -P "${libs[@]}" "$(addon_dir "$triple")/"
             done
 
-            universal_libs=("$UNIVERSAL"/*.dylib)
-            [ ${#universal_libs[@]} -gt 0 ] || { echo "::error::no universal macOS dylibs in $UNIVERSAL"; exit 1; }
+            # Include the dlopen'd backend modules (*.so: libggml-metal.so, libggml-cpu-*.so),
+            # not just the DT_NEEDED *.dylib graph — under GGML_BACKEND_DL the backends are modules.
+            universal_libs=("$UNIVERSAL"/*.dylib "$UNIVERSAL"/*.so)
+            [ ${#universal_libs[@]} -gt 0 ] || { echo "::error::no universal macOS libs in $UNIVERSAL"; exit 1; }
             mkdir -p "$ADDON/apple-darwin"
             cp -P "${universal_libs[@]}" "$ADDON/apple-darwin/"
 
@@ -491,10 +493,15 @@ jobs:
             [ ${#ort[@]} -eq 0 ] || cp -P "${ort[@]}" "$dest/"
             local abi=$2; shift 2
             for f in "$@"; do
-              [ -f "$dest/$f" ] || { echo "::error::$f missing from $d ($abi AAR)"; exit 1; }
+              case "$f" in
+                *'*'*) compgen -G "$dest/$f" >/dev/null || { echo "::error::no $f in $d ($abi AAR)"; exit 1; } ;;
+                *)     [ -f "$dest/$f" ]       || { echo "::error::$f missing from $d ($abi AAR)"; exit 1; } ;;
+              esac
             done
           }
-          ANDROID_LIBS=(libggml.so libggml-base.so libggml-cpu.so libllama.so libllama-common.so)
+          # libggml-cpu is per-microarch (GGML_CPU_ALL_VARIANTS); quote the glob so it isn't
+          # nullglob-expanded against cwd here — the check loop matches it against $dest.
+          ANDROID_LIBS=(libggml.so libggml-base.so "libggml-cpu*.so" libllama.so libllama-common.so)
           place_android aarch64-linux-android arm64-v8a "${ANDROID_LIBS[@]}"
           place_android x86_64-linux-android  x86_64    "${ANDROID_LIBS[@]}"
 
@@ -515,18 +522,21 @@ jobs:
             [ ${#libs[@]} -eq 0 ] || cp -P "${libs[@]}" "$dest/"
             local jna_dir=$2; shift 4
             for f in "$@"; do
-              [ -f "$dest/$f" ] || { echo "::error::$f missing from $d ($jna_dir JAR)"; exit 1; }
+              case "$f" in
+                *'*'*) compgen -G "$dest/$f" >/dev/null || { echo "::error::no $f in $d ($jna_dir JAR)"; exit 1; } ;;
+                *)     [ -f "$dest/$f" ]       || { echo "::error::$f missing from $d ($jna_dir JAR)"; exit 1; } ;;
+              esac
             done
           }
           # Vulkan on linux/windows, Metal on macOS — see the target cfg blocks in core/Cargo.toml.
           place_jvm x86_64-unknown-linux-gnu  linux-x86-64   libnobodywho_uniffi.so    so \
-            libggml.so libggml-base.so libggml-cpu.so libggml-vulkan.so libllama.so libllama-common.so
+            libggml.so libggml-base.so "libggml-cpu*.so" libggml-vulkan.so libllama.so libllama-common.so
           place_jvm aarch64-unknown-linux-gnu linux-aarch64  libnobodywho_uniffi.so    so \
-            libggml.so libggml-base.so libggml-cpu.so libggml-vulkan.so libllama.so libllama-common.so
+            libggml.so libggml-base.so "libggml-cpu*.so" libggml-vulkan.so libllama.so libllama-common.so
           place_jvm aarch64-apple-darwin      darwin-aarch64 libnobodywho_uniffi.dylib dylib \
-            libggml.dylib libggml-base.dylib libggml-cpu.dylib libggml-metal.dylib libllama.dylib libllama-common.dylib
+            libggml.dylib libggml-base.dylib "libggml-cpu*.so" libggml-metal.so libllama.dylib libllama-common.dylib
           place_jvm x86_64-pc-windows-msvc    win32-x86-64   nobodywho_uniffi.dll      dll \
-            ggml.dll ggml-base.dll ggml-cpu.dll ggml-vulkan.dll llama.dll llama-common.dll
+            ggml.dll ggml-base.dll "ggml-cpu*.dll" ggml-vulkan.dll llama.dll llama-common.dll
 
       - name: "Setup JDK"
         uses: actions/setup-java@v5

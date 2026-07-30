@@ -460,7 +460,9 @@ jobs:
         uses: actions/upload-artifact@v5
         with:
           name: nobodywho-godot-macos-universal-dylibs
-          path: ./universal/*.dylib
+          path: |
+            ./universal/*.dylib
+            ./universal/*.so
 
   # builds an xcframework containing static libraries for React Native iOS
   build-react-native-xcframework:
