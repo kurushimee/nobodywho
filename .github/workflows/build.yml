@@ -338,9 +338,12 @@ jobs:
             cp ./nobodywho/target/${{ matrix.target }}/release/libnobodywho_${{ matrix.integration }}.dylib \
               ./libnobodywho-${{ matrix.integration }}-${{ matrix.target }}-release.dylib
           fi
-          # Ship the ggml/llama dylibs alongside; -L dereferences any symlink. No-op for the .a slices.
+          # Ship the ggml/llama dylibs + the dlopen'd backend modules (libggml-*.so, from
+          # GGML_BACKEND_DL — co-located next to the binding by core/build.rs) alongside.
+          # -L dereferences any symlink. No-op for the .a slices.
           cp -L ./nobodywho/target/${{ matrix.target }}/${{ matrix.profile }}/libggml*.dylib ./ 2>/dev/null || true
           cp -L ./nobodywho/target/${{ matrix.target }}/${{ matrix.profile }}/libllama*.dylib ./ 2>/dev/null || true
+          cp -L ./nobodywho/target/${{ matrix.target }}/${{ matrix.profile }}/libggml*.so ./ 2>/dev/null || true
 
       - name: "Upload build artifact"
         uses: actions/upload-artifact@v5
@@ -351,6 +354,7 @@ jobs:
             ./libnobodywho-${{ matrix.integration }}-${{ matrix.target }}-release.*
             ./libggml*.dylib
             ./libllama*.dylib
+            ./libggml*.so
 
   # builds an "xcframework"
   # which is an apple thing that contains binaries for multiple systems
@@ -435,12 +439,22 @@ jobs:
 
           # The release job assembles the addon straight from this artifact, so a
           # partial set has to fail here — it cannot be detected downstream.
-          for base in libggml libggml-base libggml-cpu libggml-metal libllama libllama-common; do
-            f="universal/$base.dylib"
+          # Core DT_NEEDED dylibs + the Metal backend module are present in both arches and
+          # must be universal. (libggml-cpu/libggml-metal are no longer dylibs under
+          # GGML_BACKEND_DL — they're the modules below.)
+          for f in universal/libggml.dylib universal/libggml-base.dylib \
+                   universal/libllama.dylib universal/libllama-common.dylib \
+                   universal/libggml-metal.so; do
             [ -f "$f" ] || { echo "::error::$f missing — a macOS slice did not build it"; exit 1; }
             lipo -info "$f" | grep -q x86_64 || { echo "::error::$f has no x86_64 slice"; exit 1; }
             lipo -info "$f" | grep -q arm64  || { echo "::error::$f has no arm64 slice"; exit 1; }
           done
+          # CPU SIMD-variant modules are per-microarch (single-arch each): arm64 ships
+          # libggml-cpu-apple_*.so, x86_64 ships the non-apple variants. Require both sets.
+          ls universal/libggml-cpu-apple_*.so >/dev/null 2>&1 \
+            || { echo "::error::no arm64 (apple_*) CPU variant modules"; exit 1; }
+          ls universal/libggml-cpu-*.so 2>/dev/null | grep -qv apple_ \
+            || { echo "::error::no x86_64 CPU variant modules"; exit 1; }
 
       - name: "Upload build artifact"
         uses: actions/upload-artifact@v5
@@ -577,7 +591,8 @@ jobs:
 
           out=$(xcrun simctl spawn "$UDID" "$PWD/smoke/dlopen-smoke" "$PWD/smoke/nobodywhoFFI.framework/nobodywhoFFI")
           echo "$out"
-          echo "$out" | grep -q "DLOPEN OK"
+          # "SMOKE OK" prints only after the backend modules load and a device registers.
+          echo "$out" | grep -q "SMOKE OK"
 
   cargo-build-android:
     if: inputs.full_ci

@@ -83,13 +83,40 @@ jobs:
             cp ./assets/icon.svg "$ADDON/"
             cp ./LICENSE ./nobodywho-release/bin/addons/nobodywho/
 
+            # Generate [dependencies] from the libs actually present in each per-target
+            # subdir (the CPU-variant set differs per arch — see nobodywho.gdextension).
+            # Godot bundles these next to the binding on export; the empty destination
+            # keeps them in the binding's dir, where its rpath / load_backends_from_path find them.
+            gd="$ADDON/nobodywho.gdextension"
+            printf '\n[dependencies]\n' >> "$gd"
+            emit_deps() { # $1=platform  $2=arch (may be empty)  $3=addon subdir
+              local dir="$ADDON/$3"; [ -d "$dir" ] || return 0
+              local entries=""
+              for f in "$dir"/libggml* "$dir"/libllama* "$dir"/ggml* "$dir"/llama*; do
+                [ -e "$f" ] || continue
+                case "$(basename "$f")" in *nobodywho-godot*) continue ;; esac
+                entries="$entries\"res://addons/nobodywho/$3/$(basename "$f")\": \"\", "
+              done
+              entries="${entries%, }"
+              for cfg in debug release; do
+                local key="$1.$cfg"; [ -n "$2" ] && key="$key.$2"
+                echo "$key = { $entries }" >> "$gd"
+              done
+            }
+            emit_deps linux   x86_64 x86_64-unknown-linux-gnu
+            emit_deps linux   arm64  aarch64-unknown-linux-gnu
+            emit_deps windows x86_64 x86_64-pc-windows-msvc
+            emit_deps macos   ""     apple-darwin
+            emit_deps macos   arm64  apple-darwin
+            emit_deps android arm64  aarch64-linux-android
+
         - name: "Verify the addon has every file the .gdextension references"
           # The godot bundle has no downstream load test (unlike flutter/kotlin/apple), so a
           # missing ggml lib would otherwise ship silently and only surface as a user report.
           # Every res:// path in [libraries], [dependencies] and [icons] must exist.
           run: |
             set -euo pipefail
-            grep -o 'res://[^"]*' ./nobodywho/godot/nobodywho.gdextension | sort -u > refs.txt
+            grep -o 'res://[^"]*' nobodywho-release/bin/addons/nobodywho/nobodywho.gdextension | sort -u > refs.txt
             missing=0
             while read -r ref; do
               path="nobodywho-release/bin/${ref#res://}"
@@ -250,10 +277,14 @@ jobs:
             # sibling loop below only globs .so/.dll.
             case "$triple" in *-apple-*) continue ;; esac
             cp "$d"/libnobodywho-flutter-"$triple"-release.* "$OUT/"
+            # Manifest: the exact sibling-lib set for this triple (CPU variants included),
+            # so tool/resolve_binary.dart downloads them without a hardcoded list.
+            manifest="$OUT/nobodywho-siblings-$triple.txt"; : > "$manifest"
             for f in "$d"/libggml*.so "$d"/libllama*.so "$d"/ggml*.dll "$d"/llama*.dll "$d"/libonnxruntime*.so; do
               [ -e "$f" ] || continue
               b=$(basename "$f"); stem=${b%.*}; ext=${b##*.}
               cp "$f" "$OUT/${stem}-${triple}-release.${ext}"
+              echo "$b" >> "$manifest"
             done
           done
           ls -la "$OUT"
@@ -317,11 +348,14 @@ jobs:
           # Android gradle downloader renames them back to their SONAME in jniLibs.
           collect() { # $1=src-dir  $2=triple
             cp "$1/libnobodywho-uniffi-$2-release.so" "$OUT/"
-            # libonnxruntime*.so exists for x86_64 android only (arm64 links ORT statically); glob matches nothing there.
+            # Manifest: the exact sibling-lib set for this ABI (CPU variants + onnxruntime
+            # where present), so android/build.gradle downloads them without a hardcoded list.
+            local manifest="$OUT/nobodywho-siblings-$2.txt"; : > "$manifest"
             for so in "$1"/libggml*.so "$1"/libllama*.so "$1"/libonnxruntime*.so; do
               [ -e "$so" ] || continue
               b=$(basename "$so" .so)
               cp "$so" "$OUT/${b}-$2.so"
+              echo "${b}.so" >> "$manifest"
             done
           }
           collect ./rn-android-arm64 aarch64-linux-android

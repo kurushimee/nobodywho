@@ -51,6 +51,15 @@ if [ "$embedded" -eq 0 ]; then
     exit 1
 fi
 
+# Embed the dlopen'd ggml backend modules (CPU SIMD variants + Metal, from GGML_BACKEND_DL).
+# Plain cp: ggml loads these via load_backends_from_path at runtime (see core llm.rs), so
+# they're not @rpath-linked and need no install_name_tool. Slices legitimately differ in
+# which modules they carry, so absence is not fatal here — the runtime smoke test guards it.
+for module in "$SRC_DIR"/libggml-*.so; do
+    [ -e "$module" ] || continue
+    cp -L "$module" "$ROOT/$(basename "$module")"
+done
+
 # optional uniffi FFI module
 if [ -n "$FFI_HEADER" ]; then
     mkdir -p "$ROOT/Headers" "$ROOT/Modules"

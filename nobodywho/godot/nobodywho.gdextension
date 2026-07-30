@@ -28,25 +28,10 @@ macos.release.arm64 =    "res://addons/nobodywho/aarch64-apple-darwin/libnobodyw
 android.debug.arm64 =      "res://addons/nobodywho/aarch64-linux-android/libnobodywho-godot-aarch64-linux-android-release.so"
 android.release.arm64 =    "res://addons/nobodywho/aarch64-linux-android/libnobodywho-godot-aarch64-linux-android-release.so"
 
-# Dependencies Godot ships next to the binding on export. Godot adds the binding
-# itself with an empty destination too, so an empty destination here lands both in
-# the same directory — next to the game executable, or Contents/Frameworks in a
-# macOS .app — which is what the binding's rpath expects.
-#
-# The per-platform ggml set differs: macOS libggml-metal, Linux libggml-vulkan,
-# Android CPU only (no Vulkan/Metal). macOS has one arch-neutral entry per profile,
-# see the [libraries] note above.
-[dependencies]
-linux.debug.x86_64 = { "res://addons/nobodywho/x86_64-unknown-linux-gnu/libggml.so": "", "res://addons/nobodywho/x86_64-unknown-linux-gnu/libggml-base.so": "", "res://addons/nobodywho/x86_64-unknown-linux-gnu/libggml-cpu.so": "", "res://addons/nobodywho/x86_64-unknown-linux-gnu/libggml-vulkan.so": "", "res://addons/nobodywho/x86_64-unknown-linux-gnu/libllama.so": "", "res://addons/nobodywho/x86_64-unknown-linux-gnu/libllama-common.so": "" }
-linux.release.x86_64 = { "res://addons/nobodywho/x86_64-unknown-linux-gnu/libggml.so": "", "res://addons/nobodywho/x86_64-unknown-linux-gnu/libggml-base.so": "", "res://addons/nobodywho/x86_64-unknown-linux-gnu/libggml-cpu.so": "", "res://addons/nobodywho/x86_64-unknown-linux-gnu/libggml-vulkan.so": "", "res://addons/nobodywho/x86_64-unknown-linux-gnu/libllama.so": "", "res://addons/nobodywho/x86_64-unknown-linux-gnu/libllama-common.so": "" }
-linux.debug.arm64 = { "res://addons/nobodywho/aarch64-unknown-linux-gnu/libggml.so": "", "res://addons/nobodywho/aarch64-unknown-linux-gnu/libggml-base.so": "", "res://addons/nobodywho/aarch64-unknown-linux-gnu/libggml-cpu.so": "", "res://addons/nobodywho/aarch64-unknown-linux-gnu/libggml-vulkan.so": "", "res://addons/nobodywho/aarch64-unknown-linux-gnu/libllama.so": "", "res://addons/nobodywho/aarch64-unknown-linux-gnu/libllama-common.so": "" }
-linux.release.arm64 = { "res://addons/nobodywho/aarch64-unknown-linux-gnu/libggml.so": "", "res://addons/nobodywho/aarch64-unknown-linux-gnu/libggml-base.so": "", "res://addons/nobodywho/aarch64-unknown-linux-gnu/libggml-cpu.so": "", "res://addons/nobodywho/aarch64-unknown-linux-gnu/libggml-vulkan.so": "", "res://addons/nobodywho/aarch64-unknown-linux-gnu/libllama.so": "", "res://addons/nobodywho/aarch64-unknown-linux-gnu/libllama-common.so": "" }
-windows.debug.x86_64 = { "res://addons/nobodywho/x86_64-pc-windows-msvc/ggml.dll": "", "res://addons/nobodywho/x86_64-pc-windows-msvc/ggml-base.dll": "", "res://addons/nobodywho/x86_64-pc-windows-msvc/ggml-cpu.dll": "", "res://addons/nobodywho/x86_64-pc-windows-msvc/ggml-vulkan.dll": "", "res://addons/nobodywho/x86_64-pc-windows-msvc/llama.dll": "", "res://addons/nobodywho/x86_64-pc-windows-msvc/llama-common.dll": "" }
-windows.release.x86_64 = { "res://addons/nobodywho/x86_64-pc-windows-msvc/ggml.dll": "", "res://addons/nobodywho/x86_64-pc-windows-msvc/ggml-base.dll": "", "res://addons/nobodywho/x86_64-pc-windows-msvc/ggml-cpu.dll": "", "res://addons/nobodywho/x86_64-pc-windows-msvc/ggml-vulkan.dll": "", "res://addons/nobodywho/x86_64-pc-windows-msvc/llama.dll": "", "res://addons/nobodywho/x86_64-pc-windows-msvc/llama-common.dll": "" }
-macos.debug = { "res://addons/nobodywho/apple-darwin/libggml.dylib": "", "res://addons/nobodywho/apple-darwin/libggml-base.dylib": "", "res://addons/nobodywho/apple-darwin/libggml-cpu.dylib": "", "res://addons/nobodywho/apple-darwin/libggml-metal.dylib": "", "res://addons/nobodywho/apple-darwin/libllama.dylib": "", "res://addons/nobodywho/apple-darwin/libllama-common.dylib": "" }
-macos.release = { "res://addons/nobodywho/apple-darwin/libggml.dylib": "", "res://addons/nobodywho/apple-darwin/libggml-base.dylib": "", "res://addons/nobodywho/apple-darwin/libggml-cpu.dylib": "", "res://addons/nobodywho/apple-darwin/libggml-metal.dylib": "", "res://addons/nobodywho/apple-darwin/libllama.dylib": "", "res://addons/nobodywho/apple-darwin/libllama-common.dylib": "" }
-android.debug.arm64 = { "res://addons/nobodywho/aarch64-linux-android/libggml.so": "", "res://addons/nobodywho/aarch64-linux-android/libggml-base.so": "", "res://addons/nobodywho/aarch64-linux-android/libggml-cpu.so": "", "res://addons/nobodywho/aarch64-linux-android/libllama.so": "", "res://addons/nobodywho/aarch64-linux-android/libllama-common.so": "" }
-android.release.arm64 = { "res://addons/nobodywho/aarch64-linux-android/libggml.so": "", "res://addons/nobodywho/aarch64-linux-android/libggml-base.so": "", "res://addons/nobodywho/aarch64-linux-android/libggml-cpu.so": "", "res://addons/nobodywho/aarch64-linux-android/libllama.so": "", "res://addons/nobodywho/aarch64-linux-android/libllama-common.so": "" }
+# [dependencies] — the ggml/llama libs Godot bundles next to the binding on export —
+# is generated per-target at release time from the actual built module set (the CPU
+# SIMD variants differ per arch and would be fragile to hardcode). In the editor none
+# is needed: the binding's rpath + load_backends_from_path resolve everything.
 
 [icons]
 NobodyWhoModel =            "res://addons/nobodywho/icon.svg"

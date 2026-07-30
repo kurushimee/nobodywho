@@ -3049,6 +3049,7 @@ dependencies = [
  "lazy_static",
  "libc",
  "llama-cpp-2",
+ "llama-cpp-sys-2",
  "mel_spec",
  "miette",
  "minijinja",
