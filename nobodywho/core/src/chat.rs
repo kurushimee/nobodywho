@@ -48,7 +48,7 @@ use std::hash::Hasher;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, MutexGuard};
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error, info, trace, warn};
 
 #[derive(Deserialize, Serialize, Clone, PartialEq, Eq, Debug, Hash)]
 pub struct Asset {
@@ -253,6 +253,13 @@ pub struct ChatConfig {
     /// being written. Skipped automatically while a grammar constrains sampling —
     /// accepting tokens into a grammar sampler crashes (llama-cpp-rs#604). Off by default.
     pub accept_context: bool,
+    /// Force-close the model's reasoning block after this many response tokens. When > 0
+    /// and the `<think>` block is still open after this many emitted tokens, an
+    /// interruption sentence ending in `</think>` is injected into the generation so the
+    /// model abandons its chain of thought and writes the visible reply. `0` (the
+    /// default) disables it. Only active while the `enable_thinking` template variable is
+    /// true; ignored while a grammar constrains sampling.
+    pub think_budget: u32,
 }
 
 impl Default for ChatConfig {
@@ -267,6 +274,7 @@ impl Default for ChatConfig {
             n_threads: None,
             max_response_tokens: 0,
             accept_context: false,
+            think_budget: 0,
         }
     }
 }
@@ -607,6 +615,18 @@ impl ChatHandle {
         })
         .ok_or(crate::errors::SetterError::SetterError(
             "set_accept_context".into(),
+        ))
+    }
+
+    /// Force-close the model's reasoning block after this many response tokens.
+    /// `0` disables the budget.
+    pub fn set_think_budget(&self, think_budget: u32) -> Result<(), crate::errors::SetterError> {
+        self.set_and_wait_blocking(|output_tx| ChatMsg::SetThinkBudget {
+            think_budget,
+            output_tx,
+        })
+        .ok_or(crate::errors::SetterError::SetterError(
+            "set_think_budget".into(),
         ))
     }
 
@@ -962,6 +982,22 @@ impl ChatHandleAsync {
         ))
     }
 
+    /// Force-close the model's reasoning block after this many response tokens.
+    /// `0` disables the budget.
+    pub async fn set_think_budget(
+        &self,
+        think_budget: u32,
+    ) -> Result<(), crate::errors::SetterError> {
+        self.set_and_wait_async(|output_tx| ChatMsg::SetThinkBudget {
+            think_budget,
+            output_tx,
+        })
+        .await
+        .ok_or(crate::errors::SetterError::SetterError(
+            "set_think_budget".into(),
+        ))
+    }
+
     /// Stop the current generation if one is in progress.
     pub fn stop_generation(&self) {
         self.guard.stop();
@@ -1191,6 +1227,10 @@ enum ChatMsg {
         accept_context: bool,
         output_tx: tokio::sync::mpsc::Sender<()>,
     },
+    SetThinkBudget {
+        think_budget: u32,
+        output_tx: tokio::sync::mpsc::Sender<()>,
+    },
     GetChatHistory {
         output_tx: tokio::sync::mpsc::Sender<Vec<Message>>,
     },
@@ -1263,6 +1303,10 @@ impl std::fmt::Debug for ChatMsg {
             ChatMsg::SetAcceptContext { accept_context, .. } => f
                 .debug_struct("SetAcceptContext")
                 .field("accept_context", accept_context)
+                .finish(),
+            ChatMsg::SetThinkBudget { think_budget, .. } => f
+                .debug_struct("SetThinkBudget")
+                .field("think_budget", think_budget)
                 .finish(),
             ChatMsg::GetChatHistory { .. } => f.debug_struct("GetChatHistory").finish(),
             ChatMsg::SetChatHistory { messages, .. } => f
@@ -1369,6 +1413,13 @@ fn process_worker_msg(worker_state: &mut Chat<'_>, msg: ChatMsg) -> Result<(), C
             output_tx,
         } => {
             worker_state.accept_context = accept_context;
+            let _ = output_tx.blocking_send(());
+        }
+        ChatMsg::SetThinkBudget {
+            think_budget,
+            output_tx,
+        } => {
+            worker_state.think_budget = think_budget;
             let _ = output_tx.blocking_send(());
         }
         ChatMsg::GetChatHistory { output_tx } => {
@@ -1482,6 +1533,11 @@ impl ChatContext {
     }
 }
 
+/// Qwen3-documented early-exit phrasing used by thinking-budget implementations
+/// (vLLM, Qwen-Agent): appended mid-generation to force a runaway reasoning block
+/// closed so the model proceeds to the visible reply.
+pub(crate) const THINK_INTERRUPTION: &str = "\nConsidering the limited time by the user, I have to give the solution based on the thinking directly now.\n</think>\n\n";
+
 /// A chat session: owns an [`InferenceEngine`] plus all the conversational state
 /// (messages, tools, template, sampler config).
 struct Chat<'a> {
@@ -1497,6 +1553,7 @@ struct Chat<'a> {
     context: ChatContext,
     max_response_tokens: u32,
     accept_context: bool,
+    think_budget: u32,
 }
 
 impl<'a> Chat<'a> {
@@ -1568,6 +1625,7 @@ impl<'a> Chat<'a> {
             context: ChatContext::new(),
             max_response_tokens: config.max_response_tokens,
             accept_context: config.accept_context,
+            think_budget: config.think_budget,
         })
     }
 
@@ -1766,6 +1824,30 @@ impl<'a> Chat<'a> {
             info!(accepted, "Warmed sampler with context tokens");
         }
 
+        // think_budget: force-close a runaway reasoning block. Armed only when thinking
+        // is explicitly enabled; any grammar disables it — accepting tokens into a
+        // grammar sampler crashes (llama-cpp-rs#604), and injected tokens would desync
+        // the grammar state anyway.
+        let think_armed = self.think_budget > 0
+            && !has_grammar
+            && self
+                .template_variables
+                .get("enable_thinking")
+                .copied()
+                .unwrap_or(false);
+        let interrupt_tokens: Vec<LlamaToken> = if think_armed {
+            self.engine
+                .ctx
+                .model
+                .str_to_token(THINK_INTERRUPTION, llama_cpp_2::model::AddBos::Never)?
+        } else {
+            Vec::new()
+        };
+        // Qwen3.5-style templates pre-open the block inside the prompt's generation
+        // header; Qwen3-style models emit <think> as their first response tokens.
+        let mut think_open = think_armed && self.prompt_ends_inside_think();
+        let mut think_closed = false;
+
         // init statefull decoder for split up tokens like emojis
         let mut decoder = encoding_rs::UTF_8.new_decoder();
 
@@ -1838,9 +1920,29 @@ impl<'a> Chat<'a> {
                     trace!(?token_str, "Sending out token:");
                     respond(WriteOutput::Token(token_str.to_string()));
                     emitted_tokens += 1;
+
+                    // Track the think block by scanning only the tail of the response:
+                    // the tag can arrive as one special token or split across tokens.
+                    if think_armed && !think_closed {
+                        let mut start = full_response
+                            .len()
+                            .saturating_sub(token_str.len() + "</think>".len());
+                        while start > 0 && !full_response.is_char_boundary(start) {
+                            start -= 1;
+                        }
+                        let tail = &full_response[start..];
+                        if tail.contains("</think>") {
+                            think_closed = true;
+                        } else if !think_open && tail.contains("<think>") {
+                            think_open = true;
+                        }
+                    }
                 }
 
                 if has_eog {
+                    if think_armed && think_open && !think_closed {
+                        info!("EOG inside an open think block; leaving it unclosed");
+                    }
                     hit_eog = true;
                     break;
                 }
@@ -1850,8 +1952,50 @@ impl<'a> Chat<'a> {
                 break;
             }
 
+            if think_armed && think_open && !think_closed && emitted_tokens >= self.think_budget {
+                let needed = interrupt_tokens.len();
+                if self.engine.n_past() as usize + needed > self.engine.ctx.n_ctx() as usize {
+                    // Same replay dance as the context-full branch above. The MTP pending
+                    // token is deliberately dropped, not restored — the injection
+                    // invalidates it anyway.
+                    let _ = self.engine.take_pending();
+                    self.context_shift()?;
+                    self.sync_context_with_render(inference_lock_token)?;
+                    self.engine
+                        .read_chunks(tokens_written_until_now.clone(), inference_lock_token)?;
+                }
+                if self.engine.n_past() as usize + needed <= self.engine.ctx.n_ctx() as usize {
+                    let chunk = TokenizerChunk::new_text(interrupt_tokens.clone());
+                    let mut injected = TokenizerChunks::new();
+                    injected.append(chunk.clone());
+                    self.engine.read_chunks(injected, inference_lock_token)?;
+                    tokens_written_until_now.append(chunk);
+                    // Safe: arming requires !has_grammar (accepting into a grammar
+                    // sampler crashes, llama-cpp-rs#604).
+                    for token in &interrupt_tokens {
+                        sampler.accept(*token);
+                    }
+                    full_response.push_str(THINK_INTERRUPTION);
+                    respond(WriteOutput::Token(THINK_INTERRUPTION.to_string()));
+                    emitted_tokens += interrupt_tokens.len() as u32;
+                    // The streaming decoder may hold a partial codepoint from the last
+                    // sampled token; the injection breaks that byte continuation.
+                    decoder = encoding_rs::UTF_8.new_decoder();
+                    info!(
+                        emitted_tokens,
+                        "Hit think_budget, injected reasoning interruption"
+                    );
+                } else {
+                    warn!("Hit think_budget but no context room for the interruption; skipping");
+                }
+                think_closed = true;
+            }
+
             if self.max_response_tokens > 0 && emitted_tokens >= self.max_response_tokens {
-                debug!(emitted_tokens, "Hit max_response_tokens, ending the response");
+                debug!(
+                    emitted_tokens,
+                    "Hit max_response_tokens, ending the response"
+                );
                 break;
             }
         }
@@ -1989,6 +2133,35 @@ impl<'a> Chat<'a> {
         self.context.chunks = self.render_as_chunks(true)?;
 
         Ok(self)
+    }
+
+    /// True when the rendered prompt leaves the response inside an open `<think>`
+    /// block: Qwen3.5-style templates put the opening tag into the generation header
+    /// itself, so the response stream carries only the closing tag.
+    fn prompt_ends_inside_think(&self) -> bool {
+        let mut last_text: Option<&Vec<LlamaToken>> = None;
+        for chunk in self.context.chunks.iter() {
+            if let TokenizerChunk::Text(tokens, _) = chunk {
+                last_text = Some(tokens);
+            }
+        }
+        let Some(tokens) = last_text else {
+            return false;
+        };
+        let mut bytes: Vec<u8> = Vec::new();
+        for token in tokens.iter().skip(tokens.len().saturating_sub(8)) {
+            if let Ok(piece) = self
+                .engine
+                .ctx
+                .model
+                .token_to_piece_bytes(*token, 32, true, None)
+            {
+                bytes.extend(piece);
+            }
+        }
+        String::from_utf8_lossy(&bytes)
+            .trim_end()
+            .ends_with("<think>")
     }
 
     /// Go for the unhandled mode when you are context shifting.
@@ -3109,6 +3282,45 @@ mod tests {
         assert!(
             !res2.contains("<think>"),
             "Expected the model to not think, but it did"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_think_budget_forces_closure() -> Result<(), Box<dyn std::error::Error>> {
+        test_utils::init_test_tracing();
+        let model = test_utils::load_test_model();
+        let chat = ChatBuilder::new(model)
+            .with_context_size(4096)
+            .with_template_variable("enable_thinking".to_string(), true)
+            .build()
+            .expect("chat build failed in test");
+
+        chat.set_sampler_config(SamplerPresets::greedy())?;
+        // Small enough that natural closure cannot beat the budget on a
+        // step-by-step math prompt.
+        chat.set_think_budget(16)?;
+
+        let resp: String = chat
+            .ask("What is 17 * 23? Think through it step by step.".to_string())
+            .completed()?;
+
+        let close = resp
+            .find("</think>")
+            .expect("think block must be closed by the budget");
+        assert!(
+            resp.contains("Considering the limited time"),
+            "expected the forced interruption, got natural closure within budget: {resp}"
+        );
+        assert_eq!(resp.matches("</think>").count(), 1);
+        // Reasoning bounded: budget tokens at a generous chars-per-token slack,
+        // plus the interruption itself.
+        assert!(close < 16 * 40 + THINK_INTERRUPTION.len());
+        let reply = resp[close + "</think>".len()..].trim();
+        assert!(
+            !reply.is_empty(),
+            "visible reply after forced closure must be non-empty"
         );
 
         Ok(())

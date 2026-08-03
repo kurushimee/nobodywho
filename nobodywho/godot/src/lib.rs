@@ -691,6 +691,15 @@ struct NobodyWhoChat {
     /// Automatically skipped while a grammar constrains sampling.
     accept_context: bool,
 
+    #[export]
+    #[var(get = get_think_budget, set = set_think_budget)]
+    /// Maximum reasoning tokens before the think block is force-closed: when the model
+    /// has emitted this many tokens without closing its `<think>` block, an interruption
+    /// sentence and a closing tag are injected into the generation, and the model writes
+    /// the visible reply instead of reasoning forever. 0 disables the budget. Only
+    /// active while `allow_thinking` is on; ignored while a grammar constrains sampling.
+    think_budget: u32,
+
     // internal state
     chat_handle: Option<nobodywho::chat::ChatHandleAsync>,
     tools: Vec<nobodywho::tool_calling::Tool>,
@@ -721,6 +730,7 @@ impl INode for NobodyWhoChat {
             mtp_p_min: mtp_defaults.p_min,
             max_response_tokens: default_config.max_response_tokens,
             accept_context: default_config.accept_context,
+            think_budget: default_config.think_budget,
 
             // config
             model_node: None,
@@ -744,6 +754,7 @@ struct ChatWorkerConfig {
     mtp: Option<nobodywho::chat::MtpConfig>,
     max_response_tokens: u32,
     accept_context: bool,
+    think_budget: u32,
 }
 
 #[godot_api]
@@ -777,6 +788,7 @@ impl NobodyWhoChat {
                 n_threads: config.n_threads,
                 max_response_tokens: config.max_response_tokens,
                 accept_context: config.accept_context,
+                think_budget: config.think_budget,
             },
         )
         .map_err(|e| GString::from(e.to_string().as_str()))?;
@@ -816,6 +828,7 @@ impl NobodyWhoChat {
             mtp,
             max_response_tokens: self.max_response_tokens,
             accept_context: self.accept_context,
+            think_budget: self.think_budget,
         })
     }
 
@@ -1008,7 +1021,9 @@ impl NobodyWhoChat {
         if let Some(chat_handle) = self.chat_handle.as_ref() {
             let handle_clone = chat_handle.clone();
             godot::task::spawn(async move {
-                let result = handle_clone.set_max_response_tokens(max_response_tokens).await;
+                let result = handle_clone
+                    .set_max_response_tokens(max_response_tokens)
+                    .await;
                 if let Err(msg) = result {
                     godot_warn!("Error setting max_response_tokens: {}", msg);
                 }
@@ -1033,6 +1048,28 @@ impl NobodyWhoChat {
                 let result = handle_clone.set_accept_context(accept_context).await;
                 if let Err(msg) = result {
                     godot_warn!("Error setting accept_context: {}", msg);
+                }
+            });
+        }
+    }
+
+    #[func]
+    fn get_think_budget(&mut self) -> u32 {
+        self.think_budget
+    }
+
+    #[func]
+    fn set_think_budget(&mut self, think_budget: u32) {
+        // always mutate local state
+        self.think_budget = think_budget;
+
+        // if worker is running, also inform that
+        if let Some(chat_handle) = self.chat_handle.as_ref() {
+            let handle_clone = chat_handle.clone();
+            godot::task::spawn(async move {
+                let result = handle_clone.set_think_budget(think_budget).await;
+                if let Err(msg) = result {
+                    godot_warn!("Error setting think_budget: {}", msg);
                 }
             });
         }
