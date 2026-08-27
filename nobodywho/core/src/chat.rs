@@ -33,7 +33,7 @@ use crate::llm;
 use crate::llm::{GlobalInferenceLockToken, Worker, WorkerGuard, WriteOutput};
 use crate::sampler::read_sampler_from_metadata;
 use crate::sampler::{SamplerConfig, ShiftStep};
-use crate::template::{select_template, ChatTemplate, ChatTemplateContext};
+use crate::template::{select_template_with_override, ChatTemplate, ChatTemplateContext};
 use crate::tokenizer::{ChunkId, Prompt, PromptPart, Promptable, TokenizerChunk, TokenizerChunks};
 use crate::tool_calling::{detect_tool_format, Tool, ToolCall, ToolFormat};
 use ahash::AHasher;
@@ -232,6 +232,9 @@ pub struct ChatConfig {
     pub system_prompt: Option<String>,
     /// Variables to add to the chat template context.
     pub template_variables: std::collections::HashMap<String, bool>,
+    /// Optional Jinja chat template used instead of GGUF metadata. This also lets callers use
+    /// generation models that intentionally ship without a chat template.
+    pub chat_template_override: Option<String>,
     /// Sampler configuration for inference.
     pub sampler_config: Option<SamplerConfig>,
     /// MTP speculative decoding config. `Some(..)` enables MTP with the given
@@ -267,6 +270,7 @@ impl Default for ChatConfig {
         Self {
             n_ctx: 4096,
             template_variables: std::collections::HashMap::new(),
+            chat_template_override: None,
             system_prompt: None,
             tools: Vec::new(),
             sampler_config: None,
@@ -368,6 +372,12 @@ impl ChatBuilder {
         variables: std::collections::HashMap<String, bool>,
     ) -> Self {
         self.config.template_variables = variables;
+        self
+    }
+
+    /// Use a caller-provided Jinja chat template instead of the template in GGUF metadata.
+    pub fn with_chat_template_override<S: Into<String>>(mut self, template: S) -> Self {
+        self.config.chat_template_override = Some(template.into());
         self
     }
 
@@ -1548,6 +1558,7 @@ struct Chat<'a> {
     sampler_config: SamplerConfig,
     messages: Vec<Message>,
     template_variables: std::collections::HashMap<String, bool>,
+    chat_template_override: Option<String>,
     tools: Vec<Tool>,
     chat_template: ChatTemplate,
     context: ChatContext,
@@ -1570,7 +1581,11 @@ impl<'a> Chat<'a> {
             return Err(InitWorkerError::NotAnLLM { architecture });
         }
 
-        let template = select_template(&model.language_model, !config.tools.is_empty())?;
+        let template = select_template_with_override(
+            &model.language_model,
+            !config.tools.is_empty(),
+            config.chat_template_override.as_deref(),
+        )?;
 
         // Only detect tool calling format if tools are provided
         let (tool_format, grammar) = if !config.tools.is_empty() {
@@ -1621,6 +1636,7 @@ impl<'a> Chat<'a> {
             },
             chat_template: template,
             template_variables: config.template_variables,
+            chat_template_override: config.chat_template_override,
             tools: config.tools,
             context: ChatContext::new(),
             max_response_tokens: config.max_response_tokens,
@@ -2356,7 +2372,11 @@ impl<'a> Chat<'a> {
         };
         self.tools = tools;
 
-        self.chat_template = select_template(self.engine.ctx.model, !self.tools.is_empty())?;
+        self.chat_template = select_template_with_override(
+            self.engine.ctx.model,
+            !self.tools.is_empty(),
+            self.chat_template_override.as_deref(),
+        )?;
 
         Ok(())
     }
@@ -3374,4 +3394,9 @@ mod tests {
     }
 
     // Template rendering tests have been moved to template.rs module
+
+    #[test]
+    fn chat_config_defaults_to_embedded_template() {
+        assert_eq!(ChatConfig::default().chat_template_override, None);
+    }
 }

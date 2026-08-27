@@ -184,6 +184,11 @@ struct NobodyWhoModel {
     #[export]
     use_gpu_if_available: bool,
 
+    #[export]
+    /// Keep routed MoE expert tensors on the CPU while offloading other layers to the GPU.
+    /// This can let large sparse models run on GPUs that cannot hold the full GGUF.
+    offload_moe_to_cpu: bool,
+
     model: Option<Arc<llm::Model>>,
     /// Serializes concurrent `load_model_detached` calls on this node so the model
     /// is loaded into memory/GPU exactly once even when multiple consumer nodes
@@ -203,6 +208,7 @@ impl INode for NobodyWhoModel {
             projection_model_path: GString::from(""),
             draft_model_path: GString::from(""),
             use_gpu_if_available: true,
+            offload_moe_to_cpu: false,
             model: None,
             load_lock: Arc::new(tokio::sync::Mutex::new(())),
             base,
@@ -244,7 +250,7 @@ impl NobodyWhoModel {
         }
 
         // Extract config, then drop the guard before awaiting.
-        let (path, use_gpu, mmproj, draft) = {
+        let (path, use_gpu, mmproj, draft, offload_moe_to_cpu) = {
             let b = gd.bind();
             let mmproj = {
                 let s = b.projection_model_path.to_string();
@@ -259,6 +265,7 @@ impl NobodyWhoModel {
                 b.use_gpu_if_available,
                 mmproj,
                 draft,
+                b.offload_moe_to_cpu,
             )
         };
 
@@ -280,7 +287,14 @@ impl NobodyWhoModel {
             let _ = tx.send((d, t));
         });
 
-        let load_fut = llm::get_model_async(path, use_gpu, mmproj, draft, Some(progress));
+        let load_fut = llm::get_model_async_with_options(
+            path,
+            use_gpu,
+            mmproj,
+            draft,
+            Some(progress),
+            llm::ModelLoadOptions { offload_moe_to_cpu },
+        );
         tokio::pin!(load_fut);
 
         // select! lets one task drive the load AND drain progress on the same
@@ -647,6 +661,12 @@ struct NobodyWhoChat {
     system_prompt: GString,
 
     #[export]
+    #[var(hint = MULTILINE_TEXT)]
+    /// Optional Jinja chat template used instead of GGUF metadata. Leave empty for the model's
+    /// embedded template. This also supports generation models that ship without one.
+    chat_template_override: GString,
+
+    #[export]
     #[var(get = get_allow_thinking, set = set_allow_thinking)]
     allow_thinking: bool,
 
@@ -718,6 +738,7 @@ impl INode for NobodyWhoChat {
             // defaults
             tools: default_config.tools,
             system_prompt: GString::from(""),
+            chat_template_override: GString::from(""),
             context_length: default_config.n_ctx,
             // `n_threads` on ChatConfig is Option<u32>; 0 is the exported spelling of
             // "detect it", since the Godot inspector has no null for ints.
@@ -747,6 +768,7 @@ impl INode for NobodyWhoChat {
 struct ChatWorkerConfig {
     model_node: Gd<NobodyWhoModel>,
     system_prompt: String,
+    chat_template_override: Option<String>,
     tools: Vec<nobodywho::tool_calling::Tool>,
     n_ctx: u32,
     n_threads: Option<u32>,
@@ -783,6 +805,7 @@ impl NobodyWhoChat {
                 tools: config.tools,
                 n_ctx: config.n_ctx,
                 template_variables,
+                chat_template_override: config.chat_template_override,
                 sampler_config: None,
                 mtp: config.mtp,
                 n_threads: config.n_threads,
@@ -819,6 +842,10 @@ impl NobodyWhoChat {
         Ok(ChatWorkerConfig {
             model_node,
             system_prompt: self.system_prompt.to_string(),
+            chat_template_override: {
+                let template = self.chat_template_override.to_string();
+                (!template.is_empty()).then_some(template)
+            },
             tools: self.tools.clone(),
             n_ctx: self.context_length,
             // The exported property is a plain int, so 0 spells "detect it" — core takes

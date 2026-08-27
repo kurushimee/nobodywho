@@ -67,6 +67,12 @@ impl Model {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ModelLoadOptions {
+    /// Keep routed MoE expert tensors on the CPU while offloading other layers to the GPU.
+    pub offload_moe_to_cpu: bool,
+}
+
 pub fn has_gpu_backend() -> bool {
     #[cfg(any(
         all(target_os = "ios", target_arch = "aarch64", target_abi = "sim"),
@@ -114,6 +120,25 @@ pub fn get_model(
     draft_model_path: Option<&str>,
     progress: Option<DownloadProgressCallback>,
 ) -> Result<Model, LoadModelError> {
+    get_model_with_options(
+        model_path,
+        use_gpu_if_available,
+        mmproj_path,
+        draft_model_path,
+        progress,
+        ModelLoadOptions::default(),
+    )
+}
+
+#[tracing::instrument(level = "info", skip(progress))]
+pub fn get_model_with_options(
+    model_path: &str,
+    use_gpu_if_available: bool,
+    mmproj_path: Option<&str>,
+    draft_model_path: Option<&str>,
+    progress: Option<DownloadProgressCallback>,
+    options: ModelLoadOptions,
+) -> Result<Model, LoadModelError> {
     if model_path == "auto" && mmproj_path.is_some() {
         return Err(LoadModelError::InvalidModel(
             "Automatic model selection does not support projection models; pass an explicit multimodal model path"
@@ -149,16 +174,31 @@ pub fn get_model(
     // TODO: `LlamaModelParams` uses all devices by default. Set it to an empty list once an upstream device API is available.
     let loading_plan =
         memory::plan_model_loading(&real_model_path, real_mmproj_path.as_deref(), use_gpu);
-    let gpu_layers = loading_plan.gpu_layers;
-    for warning in &loading_plan.warnings {
-        warn!("{}", warning);
+    let gpu_layers = if options.offload_moe_to_cpu && use_gpu {
+        u32::MAX
+    } else {
+        for warning in &loading_plan.warnings {
+            warn!("{}", warning);
+        }
+        loading_plan.gpu_layers
+    };
+    if options.offload_moe_to_cpu && !use_gpu {
+        warn!("MoE CPU offload was requested without an available GPU; loading the whole model on the CPU");
     }
 
-    info!(use_gpu = use_gpu, gpu_layers = gpu_layers, "Loading model");
+    info!(
+        use_gpu = use_gpu,
+        gpu_layers = gpu_layers,
+        offload_moe_to_cpu = options.offload_moe_to_cpu,
+        "Loading model"
+    );
 
     let model_params = LlamaModelParams::default().with_n_gpu_layers(gpu_layers);
 
-    let model_params = pin!(model_params);
+    let mut model_params = pin!(model_params);
+    if options.offload_moe_to_cpu && use_gpu {
+        model_params.as_mut().add_cpu_moe_override();
+    }
     let load_span = info_span!("model_load", path = %real_model_path.display());
     let _guard = load_span.enter();
 
@@ -238,14 +278,35 @@ pub async fn get_model_async(
     draft_model_path: Option<String>,
     progress: Option<DownloadProgressCallback>,
 ) -> Result<Model, LoadModelError> {
+    get_model_async_with_options(
+        model_path,
+        use_gpu_if_available,
+        mmproj_path,
+        draft_model_path,
+        progress,
+        ModelLoadOptions::default(),
+    )
+    .await
+}
+
+#[tracing::instrument(level = "info", skip(progress))]
+pub async fn get_model_async_with_options(
+    model_path: String,
+    use_gpu_if_available: bool,
+    mmproj_path: Option<String>,
+    draft_model_path: Option<String>,
+    progress: Option<DownloadProgressCallback>,
+    options: ModelLoadOptions,
+) -> Result<Model, LoadModelError> {
     let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(4096);
     std::thread::spawn(move || {
-        output_tx.blocking_send(get_model(
+        output_tx.blocking_send(get_model_with_options(
             &model_path,
             use_gpu_if_available,
             mmproj_path.as_deref(),
             draft_model_path.as_deref(),
             progress,
+            options,
         ))
     });
 
@@ -482,6 +543,12 @@ impl<T> Drop for WorkerGuard<T> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn model_load_options_preserve_stock_loading_by_default() {
+        let options = ModelLoadOptions::default();
+        assert!(!options.offload_moe_to_cpu);
+    }
 
     #[test]
     fn rejects_projection_model_with_auto_selection() {

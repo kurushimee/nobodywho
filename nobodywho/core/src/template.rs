@@ -234,8 +234,14 @@ pub fn select_template(
     model: &llama_cpp_2::model::LlamaModel,
     with_tools: bool,
 ) -> Result<ChatTemplate, SelectTemplateError> {
-    let default_template = model.chat_template(None)?.to_string()?;
-    let tool_template = model.chat_template(Some("tool_use"));
+    select_template_with_override(model, with_tools, None)
+}
+
+pub fn select_template_with_override(
+    model: &llama_cpp_2::model::LlamaModel,
+    with_tools: bool,
+    template_override: Option<&str>,
+) -> Result<ChatTemplate, SelectTemplateError> {
     let bos = model.token_to_piece(
         model.token_bos(),
         &mut encoding_rs::UTF_8.new_decoder(),
@@ -249,22 +255,29 @@ pub fn select_template(
         None,
     )?;
 
-    let template = if !with_tools {
+    let template = if let Some(template_override) = template_override {
+        debug!("Selecting caller-provided chat template override");
+        template_override.to_string()
+    } else if !with_tools {
         // no tools. use default template.
         debug!("Selecting default template, no tools provided");
-        default_template
-    } else if let Ok(tool_template) = tool_template {
-        // tools provided, and we have a tool template, use that.
-        debug_assert!(tool_template.to_string()?.contains("tools"));
-        debug!("Selecting tool template, tools provided");
-        tool_template.to_string()?
-    } else if default_template.contains("tools") {
-        // tools provided, but no tool template, but the default template seems to mention tools
-        debug!("Selecting default template with tool support, tools provided");
-        default_template
+        model.chat_template(None)?.to_string()?
     } else {
-        // tools provided, but we have no tool-capable template
-        return Err(SelectTemplateError::NoToolTemplate);
+        let default_template = model.chat_template(None)?.to_string()?;
+        let tool_template = model.chat_template(Some("tool_use"));
+        if let Ok(tool_template) = tool_template {
+            // tools provided, and we have a tool template, use that.
+            debug_assert!(tool_template.to_string()?.contains("tools"));
+            debug!("Selecting tool template, tools provided");
+            tool_template.to_string()?
+        } else if default_template.contains("tools") {
+            // tools provided, but no tool template, but the default template seems to mention tools
+            debug!("Selecting default template with tool support, tools provided");
+            default_template
+        } else {
+            // tools provided, but we have no tool-capable template
+            return Err(SelectTemplateError::NoToolTemplate);
+        }
     };
 
     Ok(ChatTemplate::new(&template, &bos, &eos)?)
