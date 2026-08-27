@@ -6,7 +6,20 @@ use tracing::warn;
 pub(crate) struct GgufModelInfo {
     pub n_layers: u32,
     pub file_size: u64,
+    /// Architecture read from the same metadata, when the file carries all of it.
+    /// Sizes the KV cache a layer brings with it; `None` plans on weights alone.
+    pub arch: Option<ModelArchitecture>,
 }
+
+/// Context length assumed while planning the weight split. The model is loaded before
+/// any worker exists, so the real `n_ctx` only turns up later in `plan_context`; this
+/// mirrors the `ChatConfig` default a worker gets when it does not ask for another.
+const PLANNING_N_CTX: u32 = 4096;
+
+/// Headroom for the compute buffers llama.cpp allocates on the device alongside the
+/// weights. They scale with `n_ubatch` and the embedding and vocabulary sizes rather
+/// than with layer count, so a flat allowance covers them across model sizes.
+const COMPUTE_BUFFER_HEADROOM: u64 = 384 * 1024 * 1024;
 
 pub(crate) struct ModelArchitecture {
     pub n_layers: u32,
@@ -138,9 +151,25 @@ fn read_gguf_model_info(path: &Path) -> Option<GgufModelInfo> {
     // layer 0 stays on CPU and every token requires a CPU<->GPU round-trip,
     // which can degrade performance by 3-30x depending on model size.
     let block_count = find_u32(".block_count")?;
+    // The KV cache is sized per block, so the architecture keeps the raw block count
+    // rather than the offloadable-layer count above.
+    let arch = match (
+        find_u32(".embedding_length"),
+        find_u32(".attention.head_count"),
+        find_u32(".attention.head_count_kv"),
+    ) {
+        (Some(n_embd), Some(n_head), Some(n_head_kv)) => Some(ModelArchitecture {
+            n_layers: block_count,
+            n_embd,
+            n_head,
+            n_head_kv,
+        }),
+        _ => None,
+    };
     Some(GgufModelInfo {
         n_layers: block_count + 1,
         file_size,
+        arch,
     })
 }
 
@@ -155,6 +184,35 @@ fn estimate_kv_cache_bytes(arch: &ModelArchitecture, n_ctx: u32) -> u64 {
     // KV cache: 2 (K+V) * n_layers * n_ctx * n_head_kv * head_dim * 2 bytes (f16)
     let head_dim = arch.n_embd.checked_div(arch.n_head).unwrap_or(64) as u64;
     2 * arch.n_layers as u64 * n_ctx as u64 * arch.n_head_kv as u64 * head_dim * 2
+}
+
+/// Share of the KV cache a single offloaded layer takes to the device. Layers that stay
+/// on the CPU keep their share in host memory, so the reservation tracks the split.
+fn estimate_kv_bytes_per_layer(arch: Option<&ModelArchitecture>) -> u64 {
+    let Some(arch) = arch else {
+        return 0;
+    };
+    if arch.n_layers == 0 {
+        return 0;
+    }
+    estimate_kv_cache_bytes(arch, PLANNING_N_CTX) / arch.n_layers as u64
+}
+
+/// Layers that stay resident once the runtime buffers are paid for.
+///
+/// Weights are not the only thing that lands on the device. The KV cache grows with
+/// every layer offloaded and the compute buffers are allocated next to them, so a layer
+/// costs its own weights plus its slice of the cache, and the compute buffers come off
+/// the top. Spending every free byte on weights instead overshoots the device: the
+/// allocation still succeeds, the driver quietly moves part of it to system memory, and
+/// a nominally full offload then streams weights across PCIe on every token.
+fn fitting_gpu_layers(available: u64, per_layer: u64, kv_per_layer: u64, n_layers: u32) -> u32 {
+    let per_layer_total = per_layer.saturating_add(kv_per_layer);
+    if per_layer_total == 0 {
+        return n_layers;
+    }
+    let for_layers = available.saturating_sub(COMPUTE_BUFFER_HEADROOM);
+    (for_layers / per_layer_total).min(n_layers as u64) as u32
 }
 
 /// Compute how many GPU layers to offload based on available VRAM.
@@ -216,7 +274,8 @@ pub(crate) fn plan_model_loading(
         };
     }
 
-    let gpu_layers_estimate = (available / per_layer).min(info.n_layers as u64) as u32;
+    let kv_per_layer = estimate_kv_bytes_per_layer(info.arch.as_ref());
+    let gpu_layers_estimate = fitting_gpu_layers(available, per_layer, kv_per_layer, info.n_layers);
     let min_useful_layers = (info.n_layers as f64 * 0.1).ceil() as u32;
 
     let mut warnings = vec![];
@@ -383,5 +442,88 @@ mod tests {
         let without_gpu = available_model_memory_from(host(6 * GIB, 8 * GIB), &gpus, false);
         assert_eq!(with_gpu.free_bytes, 13 * GIB);
         assert_eq!(without_gpu.free_bytes, 6 * GIB);
+    }
+
+    const MIB: u64 = 1024 * 1024;
+
+    /// A 7B with 32 blocks at Q4_K_M: 4.31 GiB of weights over 33 offloadable layers,
+    /// 8 KV heads of 128, so 16 MiB of cache per layer at the planning context.
+    fn seven_b() -> (u64, u64, u32) {
+        let n_layers = 33;
+        let per_layer = 4624648896 / n_layers as u64;
+        let arch = ModelArchitecture {
+            n_layers: 32,
+            n_embd: 4096,
+            n_head: 32,
+            n_head_kv: 8,
+        };
+        (
+            per_layer,
+            estimate_kv_bytes_per_layer(Some(&arch)),
+            n_layers,
+        )
+    }
+
+    #[test]
+    fn kv_share_per_layer_matches_the_whole_cache() {
+        let arch = ModelArchitecture {
+            n_layers: 32,
+            n_embd: 4096,
+            n_head: 32,
+            n_head_kv: 8,
+        };
+        assert_eq!(estimate_kv_cache_bytes(&arch, PLANNING_N_CTX), 512 * MIB);
+        assert_eq!(estimate_kv_bytes_per_layer(Some(&arch)), 16 * MIB);
+    }
+
+    #[test]
+    fn plans_on_weights_alone_without_architecture_metadata() {
+        assert_eq!(estimate_kv_bytes_per_layer(None), 0);
+        let per_layer = 100 * MIB;
+        assert_eq!(
+            fitting_gpu_layers(COMPUTE_BUFFER_HEADROOM + 400 * MIB, per_layer, 0, 33),
+            4
+        );
+    }
+
+    #[test]
+    fn keeps_every_layer_when_the_device_has_room() {
+        let (per_layer, kv_per_layer, n_layers) = seven_b();
+        assert_eq!(
+            fitting_gpu_layers(6449 * MIB, per_layer, kv_per_layer, n_layers),
+            n_layers
+        );
+    }
+
+    #[test]
+    fn drops_layers_rather_than_overshooting_the_device() {
+        let (per_layer, kv_per_layer, n_layers) = seven_b();
+        // Spending every free byte on weights picked all 33 layers here, which overshot
+        // the device by ~600 MiB and left the driver to spill the difference.
+        let free = 4307 * MIB;
+        assert_eq!(free / per_layer, n_layers as u64 - 1);
+
+        let layers = fitting_gpu_layers(free, per_layer, kv_per_layer, n_layers);
+        assert_eq!(layers, 26);
+        assert!(layers as u64 * (per_layer + kv_per_layer) + COMPUTE_BUFFER_HEADROOM <= free);
+    }
+
+    #[test]
+    fn leaves_room_for_the_buffers_under_heavy_pressure() {
+        let (per_layer, kv_per_layer, n_layers) = seven_b();
+        let free = 2457 * MIB;
+        let layers = fitting_gpu_layers(free, per_layer, kv_per_layer, n_layers);
+        assert_eq!(layers, 13);
+        assert!(layers as u64 * (per_layer + kv_per_layer) + COMPUTE_BUFFER_HEADROOM <= free);
+    }
+
+    #[test]
+    fn offloads_nothing_when_the_buffers_alone_do_not_fit() {
+        let (per_layer, kv_per_layer, n_layers) = seven_b();
+        assert_eq!(
+            fitting_gpu_layers(COMPUTE_BUFFER_HEADROOM, per_layer, kv_per_layer, n_layers),
+            0
+        );
+        assert_eq!(fitting_gpu_layers(0, per_layer, kv_per_layer, n_layers), 0);
     }
 }
